@@ -26,28 +26,13 @@ export function Header({ tab, onTabChange, all, lastDate }) {
           gap: 10,
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-          <div
-            style={{
-              background: C.red,
-              borderRadius: 10,
-              padding: '5px 10px',
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              gap: 2,
-            }}
-          >
-            <img
-              src={LOGO}
-              alt="Ital In House"
-              style={{ height: 26, objectFit: 'contain', display: 'block' }}
-              onError={(e) => {
-                e.target.parentElement.style.display = 'none';
-              }}
-            />
-            <div style={{ fontSize: 7, color: 'rgba(255,255,255,0.75)', letterSpacing: 0.6, fontWeight: 600, whiteSpace: 'nowrap' }}>
-              GESTÃO DE CARDÁPIO
+        <div style={{ display: 'flex', alignItems: 'center', gap: 9, flexShrink: 0 }}>
+          <div style={{ lineHeight: 1.2 }}>
+            <div style={{ fontSize: 13, fontWeight: 900, color: C.red }}>
+              Ital In House
+            </div>
+            <div style={{ fontSize: 9, color: C.muted, letterSpacing: 0.4 }}>
+              GESTÃO DE ITENS PAUSADOS
             </div>
           </div>
         </div>
