@@ -1,4 +1,5 @@
 import { useState, useMemo } from 'react';
+import { SpeedInsights } from '@vercel/speed-insights/react';
 import { C } from './constants.js';
 import { Splash } from './components/layout/Splash.jsx';
 import { Header } from './components/layout/Header.jsx';
@@ -101,6 +102,7 @@ export function App({ correctHash }) {
           )}
         </main>
       </div>
+      <SpeedInsights />
     </>
   );
 }
