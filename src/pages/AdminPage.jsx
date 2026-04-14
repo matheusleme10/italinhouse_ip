@@ -8,6 +8,7 @@ import { sha256 } from '../utils/security.js';
 import { parseCSV, parseXLSX } from '../utils/parser.js';
 import { getLastDate } from '../utils/date.js';
 import { brl } from '../utils/format.js';
+import { saveDataRemote, clearDataRemote } from '../utils/remote-storage.js';
 
 // Segurança: máximo de tentativas antes do bloqueio temporário
 const MAX_ATTEMPTS = 5;
@@ -41,6 +42,10 @@ export function AdminPage({ all, onUpdate, correctHash, onClear }) {
   const [saved, setSaved] = useState(false);
   const [parseErr, setParseErr] = useState('');
   const [confirmClear, setConfirmClear] = useState(false);
+  // Upload remoto
+  const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadErr, setUploadErr] = useState('');
   // Rate limiting
   const [attempts, setAttempts] = useState(0);
   const [lockedUntil, setLockedUntil] = useState(0);
@@ -162,11 +167,23 @@ export function AdminPage({ all, onUpdate, correctHash, onClear }) {
     }
   }
 
-  function applyData() {
+  async function applyData() {
     if (!prev) return;
+    // 1. Salva localmente (imediato)
     onUpdate(prev);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 3000);
+    // 2. Sobe para a nuvem com progress bar
+    setUploading(true);
+    setUploadProgress(0);
+    setUploadErr('');
+    try {
+      await saveDataRemote(prev, correctHash, setUploadProgress);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 3000);
+    } catch (e) {
+      setUploadErr(`Dados salvos localmente, mas falhou na nuvem: ${e.message}`);
+    } finally {
+      setUploading(false);
+    }
   }
 
   function exportPNG() {
@@ -178,9 +195,14 @@ export function AdminPage({ all, onUpdate, correctHash, onClear }) {
     });
   }
 
-  function doClear() {
+  async function doClear() {
     onClear();
     setConfirmClear(false);
+    try {
+      await clearDataRemote(correctHash);
+    } catch (e) {
+      console.warn('Falha ao limpar dados remotos:', e.message);
+    }
   }
 
   if (!auth)
@@ -274,12 +296,10 @@ export function AdminPage({ all, onUpdate, correctHash, onClear }) {
         <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
           <Ic n="upload" s={16} c={C.red} /> Importar Dados
         </div>
-        <div
-          onClick={() => fileRef.current?.click()}
-          onDragOver={(e) => {
-            e.preventDefault();
-            setDrag(true);
-          }}
+        {/* label envolve o input — funciona em todos os browsers mobile sem .click() */}
+        <label
+          htmlFor="file-upload-input"
+          onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
           onDragLeave={() => setDrag(false)}
           onDrop={(e) => {
             e.preventDefault();
@@ -287,6 +307,7 @@ export function AdminPage({ all, onUpdate, correctHash, onClear }) {
             handleFile(e.dataTransfer.files[0]);
           }}
           style={{
+            display: 'block',
             border: `2px dashed ${drag ? C.red : C.border}`,
             borderRadius: 14,
             padding: '36px 20px',
@@ -299,19 +320,21 @@ export function AdminPage({ all, onUpdate, correctHash, onClear }) {
         >
           <Ic n="upload" s={28} c={drag ? C.red : C.muted} />
           <div style={{ marginTop: 9, fontWeight: 600, color: C.text }}>
-            {loading ? 'Processando...' : fname || 'Arraste ou clique para selecionar'}
+            {loading ? 'Processando...' : fname || 'Toque ou arraste para selecionar'}
           </div>
           <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>
             CSV ou XLSX · máx. 50MB
           </div>
-        </div>
-        <input
-          ref={fileRef}
-          type="file"
-          accept=".csv,.xlsx,.xls"
-          style={{ display: 'none' }}
-          onChange={(e) => handleFile(e.target.files[0])}
-        />
+          {/* Input visível mas invisível — mais compatível com iOS/Android */}
+          <input
+            id="file-upload-input"
+            ref={fileRef}
+            type="file"
+            accept=".csv,text/csv,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.xls,application/vnd.ms-excel"
+            style={{ position: 'absolute', opacity: 0, width: 0, height: 0 }}
+            onChange={(e) => { handleFile(e.target.files[0]); e.target.value = ''; }}
+          />
+        </label>
         {parseErr && (
           <div
             style={{
@@ -369,24 +392,36 @@ export function AdminPage({ all, onUpdate, correctHash, onClear }) {
               </table>
             </div>
             <div style={{ display: 'flex', gap: 9 }}>
-              <button
-                onClick={applyData}
-                style={{
-                  flex: 1,
-                  padding: 11,
-                  borderRadius: 10,
-                  background: saved ? C.green : C.red,
-                  color: 'white',
-                  border: 'none',
-                  fontWeight: 700,
-                  fontSize: 14,
-                  cursor: 'pointer',
-                  fontFamily: 'inherit',
-                  transition: 'background .3s',
-                }}
-              >
-                {saved ? '✓ Dados Aplicados!' : 'Aplicar Dados'}
-              </button>
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <button
+                  onClick={applyData}
+                  disabled={uploading}
+                  style={{
+                    width: '100%',
+                    padding: 11,
+                    borderRadius: 10,
+                    background: saved ? C.green : uploading ? C.blue : C.red,
+                    color: 'white',
+                    border: 'none',
+                    fontWeight: 700,
+                    fontSize: 14,
+                    cursor: uploading ? 'not-allowed' : 'pointer',
+                    fontFamily: 'inherit',
+                    transition: 'background .3s',
+                  }}
+                >
+                  {saved ? '✓ Salvo na nuvem!' : uploading ? `Enviando… ${uploadProgress}%` : 'Aplicar e Salvar na Nuvem'}
+                </button>
+                {/* Barra de progresso do upload */}
+                {uploading && (
+                  <div style={{ height: 5, background: C.border, borderRadius: 99, overflow: 'hidden' }}>
+                    <div style={{ height: '100%', width: `${uploadProgress}%`, background: C.blue, borderRadius: 99, transition: 'width .3s' }} />
+                  </div>
+                )}
+                {uploadErr && (
+                  <div style={{ fontSize: 11, color: C.amber, fontWeight: 600 }}>{uploadErr}</div>
+                )}
+              </div>
               <button
                 onClick={() => {
                   setPrev(null);
