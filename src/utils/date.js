@@ -26,3 +26,26 @@ export function getLastDate(data) {
     return (!da || !db) ? 0 : da - db;
   })[dates.length - 1];
 }
+
+/** Retorna todas as datas únicas dos dados, ordenadas cronologicamente. */
+export function getAllSortedDates(data) {
+  const unique = [...new Set(data.map(r => r.dia).filter(Boolean))];
+  return unique.sort((a, b) => {
+    const da = parseDate(a);
+    const db = parseDate(b);
+    return (!da || !db) ? 0 : da - db;
+  });
+}
+
+/** Filtra rows cujo dia está dentro do intervalo [from, to] (strings de data). */
+export function filterByDateRange(data, from, to) {
+  if (!from && !to) return data;
+  return data.filter(r => {
+    if (!r.dia) return false;
+    const d = parseDate(r.dia);
+    if (!d) return false;
+    if (from) { const df = parseDate(from); if (df && d < df) return false; }
+    if (to)   { const dt = parseDate(to);   if (dt && d > dt) return false; }
+    return true;
+  });
+}
