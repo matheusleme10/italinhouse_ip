@@ -19,10 +19,11 @@ export const LOGO = 'https://d7jztl9hjt0p1.cloudfront.net/1.0.0.119/assets/image
 export const LS_KEY = 'italinhouse_v6';
 
 export const TABS = [
-  { id: 'dash', label: 'Dashboard', icon: 'dash' },
-  { id: 'franch', label: 'Franquias', icon: 'store' },
-  { id: 'items', label: 'Itens', icon: 'item' },
-  { id: 'cats', label: 'Categorias', icon: 'cat' },
-  { id: 'alerts', label: 'Alertas', icon: 'alert' },
-  { id: 'admin', label: 'Admin', icon: 'admin' },
+  { id: 'dash',   label: 'Dashboard',  icon: 'dash'   },
+  { id: 'franch', label: 'Franquias',  icon: 'store'  },
+  { id: 'items',  label: 'Itens',      icon: 'item'   },
+  { id: 'cats',   label: 'Categorias', icon: 'cat'    },
+  { id: 'alerts', label: 'Alertas',    icon: 'alert'  },
+  { id: 'rank',   label: 'Ranking',    icon: 'trophy' },
+  { id: 'admin',  label: 'Admin',      icon: 'admin'  },
 ];
