@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import html2canvas from 'html2canvas';
 import { C } from '../constants.js';
 import { Card } from '../components/ui/Card.jsx';
@@ -8,6 +8,12 @@ import { sha256 } from '../utils/security.js';
 import { parseCSV, parseXLSX } from '../utils/parser.js';
 import { getLastDate } from '../utils/date.js';
 import { brl } from '../utils/format.js';
+
+// Segurança: máximo de tentativas antes do bloqueio temporário
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_MS = 30_000; // 30 segundos
+// Segurança: timeout de sessão por inatividade (30 minutos)
+const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
 
 function Empty() {
   return (
@@ -35,14 +41,78 @@ export function AdminPage({ all, onUpdate, correctHash, onClear }) {
   const [saved, setSaved] = useState(false);
   const [parseErr, setParseErr] = useState('');
   const [confirmClear, setConfirmClear] = useState(false);
+  // Rate limiting
+  const [attempts, setAttempts] = useState(0);
+  const [lockedUntil, setLockedUntil] = useState(0);
+  const [lockCountdown, setLockCountdown] = useState(0);
+  // Session timeout
+  const sessionTimerRef = useRef(null);
   const fileRef = useRef();
 
+  // Atualiza o contador de bloqueio a cada segundo
+  useEffect(() => {
+    if (lockedUntil <= 0) return;
+    const interval = setInterval(() => {
+      const remaining = Math.ceil((lockedUntil - Date.now()) / 1000);
+      if (remaining <= 0) {
+        setLockedUntil(0);
+        setLockCountdown(0);
+        setAttempts(0);
+        clearInterval(interval);
+      } else {
+        setLockCountdown(remaining);
+      }
+    }, 500);
+    return () => clearInterval(interval);
+  }, [lockedUntil]);
+
+  // Timeout de sessão: desloga após SESSION_TIMEOUT_MS de inatividade
+  const resetSessionTimer = useCallback(() => {
+    if (sessionTimerRef.current) clearTimeout(sessionTimerRef.current);
+    sessionTimerRef.current = setTimeout(() => {
+      setAuth(false);
+      setPwd('');
+      setErr('Sessão expirada por inatividade.');
+    }, SESSION_TIMEOUT_MS);
+  }, []);
+
+  useEffect(() => {
+    if (!auth) return;
+    resetSessionTimer();
+    const events = ['mousedown', 'keydown', 'touchstart', 'scroll'];
+    events.forEach((e) => window.addEventListener(e, resetSessionTimer));
+    return () => {
+      if (sessionTimerRef.current) clearTimeout(sessionTimerRef.current);
+      events.forEach((e) => window.removeEventListener(e, resetSessionTimer));
+    };
+  }, [auth, resetSessionTimer]);
+
   async function login() {
+    // Verifica bloqueio por tentativas excessivas
+    if (Date.now() < lockedUntil) return;
+
+    if (!correctHash) {
+      setErr('Acesso Admin não configurado. Defina VITE_ADMIN_HASH no .env.');
+      return;
+    }
+
     const h = await sha256(pwd.trim());
     if (h === correctHash) {
       setAuth(true);
       setErr('');
-    } else setErr('Senha incorreta');
+      setAttempts(0);
+    } else {
+      const newAttempts = attempts + 1;
+      setAttempts(newAttempts);
+      if (newAttempts >= MAX_ATTEMPTS) {
+        const until = Date.now() + LOCKOUT_MS;
+        setLockedUntil(until);
+        setLockCountdown(Math.ceil(LOCKOUT_MS / 1000));
+        setErr(`Muitas tentativas. Aguarde ${Math.ceil(LOCKOUT_MS / 1000)}s.`);
+      } else {
+        setErr(`Senha incorreta. Tentativas restantes: ${MAX_ATTEMPTS - newAttempts}`);
+      }
+    }
   }
 
   function handleFile(file) {
@@ -52,8 +122,8 @@ export function AdminPage({ all, onUpdate, correctHash, onClear }) {
       setParseErr('Formato inválido. Use CSV ou XLSX.');
       return;
     }
-    if (file.size > 10 * 1024 * 1024) {
-      setParseErr('Arquivo muito grande. Máximo 10MB.');
+    if (file.size > 50 * 1024 * 1024) {
+      setParseErr('Arquivo muito grande. Máximo 50MB.');
       return;
     }
     setLoading(true);
@@ -173,20 +243,21 @@ export function AdminPage({ all, onUpdate, correctHash, onClear }) {
           {err && <div style={{ color: C.red, fontSize: 12, marginBottom: 10, fontWeight: 600 }}>{err}</div>}
           <button
             onClick={login}
+            disabled={Date.now() < lockedUntil}
             style={{
               width: '100%',
               padding: 12,
               borderRadius: 10,
-              background: C.red,
+              background: Date.now() < lockedUntil ? C.muted : C.red,
               color: 'white',
               border: 'none',
               fontWeight: 700,
               fontSize: 14,
-              cursor: 'pointer',
+              cursor: Date.now() < lockedUntil ? 'not-allowed' : 'pointer',
               fontFamily: 'inherit',
             }}
           >
-            Entrar
+            {lockCountdown > 0 ? `Bloqueado por ${lockCountdown}s` : 'Entrar'}
           </button>
         </Card>
       </div>
@@ -231,7 +302,7 @@ export function AdminPage({ all, onUpdate, correctHash, onClear }) {
             {loading ? 'Processando...' : fname || 'Arraste ou clique para selecionar'}
           </div>
           <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>
-            CSV ou XLSX · máx. 10MB
+            CSV ou XLSX · máx. 50MB
           </div>
         </div>
         <input
