@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { C } from './constants.js';
 import { Splash } from './components/layout/Splash.jsx';
 import { Header } from './components/layout/Header.jsx';
@@ -12,19 +12,32 @@ import { AdminPage } from './pages/AdminPage.jsx';
 import { RankPage } from './pages/RankPage.jsx';
 import { loadData, saveData, clearData } from './utils/storage.js';
 import { getAllSortedDates, filterByDateRange } from './utils/date.js';
+import { loadDataRemote } from './utils/remote-storage.js';
 
 export function App({ correctHash }) {
-  const [splash, setSplash] = useState(true);
-  const [tab, setTab]       = useState('dash');
-  const [all, setAll]       = useState(loadData);
+  const [splash, setSplash]   = useState(true);
+  const [tab, setTab]         = useState('dash');
+  const [all, setAll]         = useState(loadData);   // carrega localStorage imediatamente
+  const [syncing, setSyncing] = useState(false);      // indicador de sincronização com nuvem
+  const [period, setPeriod]   = useState({ from: null, to: null });
 
-  // Estado do filtro de período: { from, to } como strings de data (ex: "10-jan-25")
-  const [period, setPeriod] = useState({ from: null, to: null });
+  // Ao montar: tenta carregar dados mais recentes da nuvem
+  useEffect(() => {
+    setSyncing(true);
+    loadDataRemote()
+      .then(rows => {
+        if (rows && rows.length > 0) {
+          setAll(rows);
+          saveData(rows);      // atualiza o cache local
+          setPeriod({ from: null, to: null });
+        }
+      })
+      .finally(() => setSyncing(false));
+  }, []);
 
   function update(rows) {
     setAll(rows);
     saveData(rows);
-    // Ao importar novos dados, reseta período para o último dia
     setPeriod({ from: null, to: null });
   }
 
@@ -35,15 +48,11 @@ export function App({ correctHash }) {
     setPeriod({ from: null, to: null });
   }
 
-  // Todas as datas disponíveis nos dados, ordenadas cronologicamente
-  const sortedDates = useMemo(() => getAllSortedDates(all), [all]);
-
-  // Período efetivo: se o usuário não escolheu nada, usa o último dia (comportamento padrão)
+  const sortedDates   = useMemo(() => getAllSortedDates(all), [all]);
   const lastDate      = sortedDates.length ? sortedDates[sortedDates.length - 1] : null;
   const effectiveFrom = period.from ?? lastDate;
   const effectiveTo   = period.to   ?? lastDate;
 
-  // Dados filtrados pelo período — substitui o antigo "today" em todas as páginas
   const filtered = useMemo(
     () => filterByDateRange(all, effectiveFrom, effectiveTo),
     [all, effectiveFrom, effectiveTo]
@@ -58,9 +67,8 @@ export function App({ correctHash }) {
       {splash && <Splash onDone={() => setSplash(false)} />}
       <div style={{ minHeight: '100vh', background: C.bg }}>
 
-        <Header tab={tab} onTabChange={setTab} all={all} lastDate={lastDate} />
+        <Header tab={tab} onTabChange={setTab} all={all} lastDate={lastDate} syncing={syncing} />
 
-        {/* Barra de filtro de período — só aparece quando há dados carregados */}
         {all.length > 0 && (
           <DateRangeFilter
             dates={sortedDates}
