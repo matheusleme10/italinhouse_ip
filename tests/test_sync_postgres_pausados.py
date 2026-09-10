@@ -305,3 +305,74 @@ def test_build_flat_rows_ignora_linha_sem_data():
     rows = [_pg_row("Loja X", "Cat", "Item 1", "Ativo", 10, data=None)]
     flat_rows, _ = build_flat_rows(rows)
     assert flat_rows == []
+
+
+def _payload_com_n_dias(n: int) -> dict:
+    """Monta um payload já mesclado (rows[0] com catalogCube/networkHistory/
+    unitHistory), um dia por índice, pra testar trim_payload_to_fit sem
+    precisar de 600 mil linhas reais."""
+    rows = []
+    for i in range(n):
+        dia = (datetime(2026, 9, 1) + timedelta(days=i)).date().isoformat()
+        rows.append({
+            "loja": "Loja X", "categoria": "Cat", "item": f"Item {i}",
+            "dia": dia, "shift": "Almoço", "status": "Ativo",
+            "preco": "10,00", "precoNum": 10.0,
+        })
+    rows[0]["catalogCube"] = {
+        "version": 1, "stores": ["Loja X"], "items": [r["item"] for r in rows],
+        "categories": ["Cat"], "dates": [r["dia"] for r in rows], "shifts": ["Almoço"],
+        "records": [[0, i, 0, i, 0, 0, 10.0] for i in range(n)],
+    }
+    rows[0]["networkHistory"] = [
+        {"date": r["dia"], "shift": "Almoço", "activeItems": 1, "pausedItems": 0,
+         "totalItems": 1, "pausedRevenue": 0, "activePct": 1, "pausedPct": 0}
+        for r in rows
+    ]
+    rows[0]["unitHistory"] = [
+        {"label": "Loja X", "date": r["dia"], "shift": "Almoço",
+         "active": 1, "paused": 0, "total": 1, "pausedRevenue": 0, "pausedPct": 0}
+        for r in rows
+    ]
+    return {"rows": rows, "totalRows": len(rows), "uploadedAt": "2026-09-10T00:00:00"}
+
+
+def test_trim_payload_to_fit_nao_mexe_se_ja_coube():
+    from scripts.sync_postgres_pausados import trim_payload_to_fit, _gzip_size
+
+    payload = _payload_com_n_dias(5)
+    folgado = _gzip_size(payload) + 1_000_000
+    trimmed = trim_payload_to_fit(payload, folgado)
+
+    assert trimmed["totalRows"] == payload["totalRows"]
+    assert {r["dia"] for r in trimmed["rows"]} == {r["dia"] for r in payload["rows"]}
+
+
+def test_trim_payload_to_fit_corta_dias_mais_antigos_mantendo_os_recentes():
+    from scripts.sync_postgres_pausados import trim_payload_to_fit, _gzip_size
+
+    payload = _payload_com_n_dias(10)
+    orcamento_apertado = _gzip_size(payload) // 2  # força cortar pelo menos alguns dias
+
+    trimmed = trim_payload_to_fit(payload, orcamento_apertado)
+
+    dias_originais = sorted({r["dia"] for r in payload["rows"]})
+    dias_restantes = sorted({r["dia"] for r in trimmed["rows"]})
+    assert len(dias_restantes) < len(dias_originais)
+    assert dias_restantes[-1] == dias_originais[-1]  # sempre mantém o mais recente
+    assert set(dias_restantes) <= set(dias_originais[-len(dias_restantes):])  # sempre os do fim, nunca do meio
+
+    # catalogCube/networkHistory/unitHistory ficam coerentes com os dias que sobraram
+    cube_dates = {trimmed["rows"][0]["catalogCube"]["dates"][r[3]] for r in trimmed["rows"][0]["catalogCube"]["records"]}
+    assert cube_dates == set(dias_restantes)
+    assert {e["date"] for e in trimmed["rows"][0]["networkHistory"]} == set(dias_restantes)
+
+
+def test_trim_payload_to_fit_nunca_fica_com_zero_dias():
+    from scripts.sync_postgres_pausados import trim_payload_to_fit
+
+    payload = _payload_com_n_dias(3)
+    trimmed = trim_payload_to_fit(payload, max_bytes=1)  # orçamento impossível
+
+    assert trimmed["totalRows"] >= 1
+    assert len({r["dia"] for r in trimmed["rows"]}) == 1  # não corta o último dia que sobrou

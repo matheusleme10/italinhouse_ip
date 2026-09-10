@@ -460,6 +460,91 @@ def fetch_current_payload(session: requests.Session, base_url: str) -> dict:
     return data
 
 
+MAX_UPLOAD_BYTES = 3_800_000  # margem abaixo do limite de 4 MB do backend (ver backend/main.py)
+
+
+def _gzip_size(payload: dict, compresslevel: int = 6) -> int:
+    return len(gzip.compress(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        compresslevel=compresslevel,
+    ))
+
+
+def _apply_day_cutoff(payload: dict, cutoff: str) -> dict:
+    """Reaplica um corte de data sobre um payload JÁ mesclado (mesma lógica
+    de retenção de merge_payload) — usado por trim_payload_to_fit pra
+    encolher o payload quando ele fica grande demais pra caber num upload
+    só."""
+    rows = [row for row in payload["rows"] if not row.get("dia") or row["dia"] >= cutoff]
+    if not rows:
+        rows = payload["rows"][:1]
+    meta = payload["rows"][0] if payload["rows"] else {}
+
+    def within(value):
+        return not value or value >= cutoff
+
+    network_history = [e for e in (meta.get("networkHistory") or []) if within(e.get("date"))]
+    unit_history = [e for e in (meta.get("unitHistory") or []) if within(e.get("date"))]
+    catalog_history = [
+        e for e in (meta.get("catalogHistory") or meta.get("catalogRows") or []) if within(e.get("dia"))
+    ]
+    product_history = [e for e in (meta.get("productHistory") or []) if within(e.get("dia"))]
+    forneria_history = [e for e in (meta.get("forneriaSummaryHistory") or []) if within(e.get("date"))]
+    catalog_cube = meta.get("catalogCube")
+    if catalog_cube and catalog_cube.get("records"):
+        catalog_cube = {
+            **catalog_cube,
+            "records": [r for r in catalog_cube["records"] if within(catalog_cube["dates"][r[3]])],
+        }
+
+    # Mesmos campos que merge_payload já define em rows[0] — replicado aqui
+    # pra um corte extra não deixar nada "pela metade" (ver META_FIELDS).
+    rows[0] = {
+        **rows[0],
+        "networkSummary": meta.get("networkSummary"),
+        "networkHistory": network_history,
+        "unitHistory": unit_history,
+        "catalogHistory": catalog_history,
+        "productHistory": product_history,
+        "forneriaSummaryHistory": forneria_history,
+        "catalogCube": catalog_cube,
+        "unitStats": meta.get("unitStats") or [],
+        "dataShift": meta.get("dataShift"),
+        "catalogRows": meta.get("catalogRows") or [],
+    }
+    return {"rows": rows, "totalRows": len(rows), "uploadedAt": payload.get("uploadedAt")}
+
+
+def trim_payload_to_fit(payload: dict, max_bytes: int = MAX_UPLOAD_BYTES) -> dict:
+    """upload_payload manda o payload inteiro de uma vez, igual o upload
+    manual sempre fez. Com o Postgres trazendo o catálogo completo (não só
+    os itens pausados) de centenas de lojas/itens por dia, poucas semanas de
+    histórico retido já passam do limite de 4 MB comprimido do endpoint
+    (ver backend/main.py: upload_compressed_data). Em vez de falhar com 413,
+    cortamos os dias mais antigos — um de cada vez, sempre mantendo os mais
+    recentes — até caber, e avisamos no log quanto foi cortado, pra não ser
+    surpresa silenciosa."""
+    dias = sorted({row["dia"] for row in payload["rows"] if row.get("dia")})
+    if len(dias) <= 1:
+        return payload
+
+    tentativa = payload
+    dias_cortados = 0
+    while _gzip_size(tentativa) > max_bytes and len(dias) > 1:
+        dias = dias[1:]  # derruba o dia mais antigo que sobrou
+        tentativa = _apply_day_cutoff(payload, dias[0])
+        dias_cortados += 1
+
+    if dias_cortados:
+        tamanho_mb = _gzip_size(tentativa) / 1_000_000
+        print(
+            f"[aviso] payload passou de {max_bytes / 1_000_000:.1f} MB comprimido — "
+            f"cortei os {dias_cortados} dia(s) mais antigo(s) pra caber "
+            f"(ficou em ~{tamanho_mb:.1f} MB, mantendo a partir de {dias[0]})."
+        )
+    return tentativa
+
+
 def upload_payload(session: requests.Session, base_url: str, payload: dict) -> dict:
     compressed = gzip.compress(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
@@ -517,6 +602,7 @@ def main() -> int:
         login(session, base_url, admin_password)
         current_payload = fetch_current_payload(session, base_url)
         merged_payload = merge_payload(current_payload, flat_rows, extra)
+        merged_payload = trim_payload_to_fit(merged_payload)
 
         if args.dry_run:
             print(f"[dry-run] Mesclaria para {merged_payload['totalRows']} linha(s) totais — nada foi enviado.")
