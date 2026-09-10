@@ -333,12 +333,17 @@ export function App() {
   }
 
   const activeBrand = context?.brandId ? brandById(context.brandId) : null;
-  const displayShift = effectiveShift;
+  // "Atualizado até" no rodapé da sidebar tem que mostrar a última carga
+  // REAL (data+turno), não o filtro que o usuário tem selecionado na tela —
+  // senão clicar em "Almoço" faz o rótulo dizer "Atualizado até Almoço"
+  // mesmo já existindo uma carga de Jantar mais recente.
+  const lastLoadDate = latestFullLoad?.date || lastDate;
+  const lastLoadShift = latestFullLoad?.shift || defaultShift;
 
   return (
     <div className="app-shell has-sidebar" style={activeBrand ? { '--portal-accent': activeBrand.color, '--portal-accent-soft': activeBrand.soft } : undefined}>
-      <PortalHeader tab={tab} onTabChange={setTab} all={pageRows} lastDate={lastDate}
-        shift={displayShift} syncing={syncing} context={context} role={auth.role}
+      <PortalHeader tab={tab} onTabChange={setTab} all={pageRows} lastDate={lastLoadDate}
+        shift={lastLoadShift} syncing={syncing} context={context} role={auth.role}
         onChangeContext={isAdmin ? null : () => { setContext(null); setTab('dash'); }} onLogout={logout} />
 
       <div className="app-content">
