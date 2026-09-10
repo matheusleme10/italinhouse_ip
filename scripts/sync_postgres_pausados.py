@@ -446,7 +446,7 @@ def main() -> int:
     args = parser.parse_args()
 
     database_url = _env("DATABASE_URL")
-    base_url = _env("DASHBOARD_URL").rstrip("/")
+    base_url = _env("DASHBOARD_PUBLIC_URL").rstrip("/")
     admin_password = _env("DASHBOARD_ADMIN_PASSWORD")
 
     print(f"Buscando linhas dos últimos {POSTGRES_LOOKBACK_DAYS} dias no Postgres...")
