@@ -4,6 +4,11 @@ from __future__ import annotations
 tabela produtos_pausados — alimentada por uma ponte Access -> Postgres fora
 deste projeto) para o dashboard.
 
+O dia/turno de cada linha vêm da coluna "data" (quando o item foi observado
+de verdade no Access, linha a linha, dia a dia) — não de "atualizado_em"
+(que só marca quando a linha chegou no Postgres; a tabela foi carregada de
+uma vez só, então "atualizado_em" não serve pra separar por dia).
+
 Não é um endpoint novo no backend: este script reaproveita exatamente o
 mesmo caminho que o upload manual de planilha já usa — loga como admin,
 busca o payload atual (GET /api/data), mescla os dados novos do Postgres com
@@ -35,8 +40,7 @@ import gzip
 import json
 import os
 import sys
-from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -96,12 +100,20 @@ def _pg_connection_kwargs() -> dict:
 
 
 def fetch_postgres_rows(pg_kwargs: dict) -> list[dict]:
-    since = datetime.now(timezone.utc) - timedelta(days=POSTGRES_LOOKBACK_DAYS)
+    # "data" é quando o item foi observado de verdade no Access, dia a dia —
+    # é ela que carrega o histórico real. "atualizado_em" só marca quando a
+    # linha chegou no Postgres (a tabela foi criada e carregada de uma vez,
+    # então quase todo mundo tem o mesmo atualizado_em). Por isso filtramos e
+    # ordenamos por "data", não por "atualizado_em" (era esse o bug).
+    # "data" é timestamp SEM timezone (hora local já, do Access), então o
+    # corte de N dias também precisa ser um horário local "ingênuo" (sem tz)
+    # pra comparar igual.
+    since = (datetime.now(BR_TZ) - timedelta(days=POSTGRES_LOOKBACK_DAYS)).replace(tzinfo=None)
     query = """
-        SELECT lojas_simple_name, categories_name, rows_name, status, price_value, atualizado_em
+        SELECT lojas_simple_name, categories_name, rows_name, status, price_value, data
         FROM dados_ifood.produtos_pausados
-        WHERE atualizado_em >= %s
-        ORDER BY atualizado_em
+        WHERE data >= %s
+        ORDER BY data
     """
     with psycopg2.connect(**pg_kwargs) as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -114,44 +126,28 @@ def _status_to_ativo_pausado(raw_status) -> str:
     return "Ativo" if normalized in STATUS_ATIVO_ALIASES else "Pausado"
 
 
-def _assign_shifts(pg_rows: list[dict]) -> dict[datetime, str]:
-    """Essa tabela não tem coluna de turno, e todas as lojas sincronizam
-    juntas no mesmo lote (mesmo timestamp em atualizado_em). Então: agrupamos
-    por dia local (America/Sao_Paulo) os timestamps distintos de sincronização
-    encontrados; o primeiro do dia vira Almoço, os seguintes viram Jantar. Se
-    só existir 1 lote naquele dia, cai no mesmo critério hora<17h já usado em
-    outro lugar do backend (main.py: shift = 'Almoço' if now.hour < 17 else
-    'Jantar')."""
-    timestamps_by_day: dict[date, set[datetime]] = defaultdict(set)
-    for row in pg_rows:
-        local_ts = row["atualizado_em"].astimezone(BR_TZ)
-        timestamps_by_day[local_ts.date()].add(local_ts)
-
-    shift_by_timestamp: dict[datetime, str] = {}
-    for _day, timestamps in timestamps_by_day.items():
-        ordered = sorted(timestamps)
-        if len(ordered) == 1:
-            shift_by_timestamp[ordered[0]] = "Almoço" if ordered[0].hour < 17 else "Jantar"
-            continue
-        shift_by_timestamp[ordered[0]] = "Almoço"
-        for extra in ordered[1:]:
-            shift_by_timestamp[extra] = "Jantar"
-    return shift_by_timestamp
+def _shift_from_hour(hour: int) -> str:
+    # Mesmo critério já usado em outro lugar do backend
+    # (main.py: shift = 'Almoço' if now.hour < 17 else 'Jantar').
+    return "Almoço" if hour < 17 else "Jantar"
 
 
 def build_flat_rows(pg_rows: list[dict]) -> tuple[list[dict], list[str]]:
     """Converte linhas do Postgres no mesmo formato flat usado no resto do
-    app: {loja, categoria, item, dia, shift, status, preco, precoNum}."""
-    shift_by_timestamp = _assign_shifts(pg_rows)
+    app: {loja, categoria, item, dia, shift, status, preco, precoNum}.
+
+    dia/turno vêm de "data" (quando o item foi observado de verdade no
+    Access, linha a linha) — não de "atualizado_em" (que só diz quando a
+    linha chegou no Postgres)."""
     flat_rows: list[dict] = []
     unknown_status: set[str] = set()
 
     for row in pg_rows:
         loja = (row.get("lojas_simple_name") or "").strip()
         item = (row.get("rows_name") or "").strip()
-        if not loja or not item:
+        observado_em = row.get("data")
+        if not loja or not item or not observado_em:
             continue
-        local_ts = row["atualizado_em"].astimezone(BR_TZ)
         raw_status = row.get("status")
         normalized_status = str(raw_status or "").strip().lower()
         if normalized_status not in STATUS_ATIVO_ALIASES | STATUS_PAUSADO_ALIASES:
@@ -161,8 +157,8 @@ def build_flat_rows(pg_rows: list[dict]) -> tuple[list[dict], list[str]]:
             "loja": loja,
             "categoria": (row.get("categories_name") or "").strip() or "Sem categoria",
             "item": item,
-            "dia": local_ts.date().isoformat(),
-            "shift": shift_by_timestamp[local_ts],
+            "dia": observado_em.date().isoformat(),
+            "shift": _shift_from_hour(observado_em.hour),
             "status": _status_to_ativo_pausado(raw_status),
             "preco": f"{preco:.2f}".replace(".", ","),
             "precoNum": preco,
@@ -178,9 +174,10 @@ def _dedupe_flat_rows(flat_rows: list[dict]) -> list[dict]:
     build_cube_and_history conta cada duplicata como um item a mais (inflando
     totalItems/pausedItems) e o catalogCube fica com um registro por linha
     bruta em vez de um por combinação — foi isso que deixou o payload gigante
-    e o dashboard lento. Como pg_rows já vem ORDER BY atualizado_em, a última
-    ocorrência de cada chave é sempre o estado mais recente, então bastar
-    sobrescrever por chave já preserva 'o valor mais novo vence'."""
+    e o dashboard lento. Como pg_rows já vem ORDER BY data, a última
+    ocorrência de cada chave (mesmo dia+turno) é sempre o estado mais
+    recente, então bastar sobrescrever por chave já preserva 'o valor mais
+    novo vence'."""
     deduped: dict[str, dict] = {}
     for row in flat_rows:
         key = f"{row['loja']}|{row['categoria']}|{row['item']}|{row['dia']}|{row['shift']}"

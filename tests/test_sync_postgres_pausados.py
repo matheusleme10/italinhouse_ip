@@ -1,35 +1,42 @@
 """Testes do script scripts/sync_postgres_pausados.py, usando como fixture
 uma amostra REAL de linhas de dados_ifood.produtos_pausados (coladas pelo
-usuário em 2026-09-10, lojas Caipira - Bauru e Caipira - Campo Limpo SP)."""
+usuário em 2026-09-10, lojas Caipira - Bauru e Caipira - Campo Limpo SP).
 
-from datetime import datetime, timedelta, timezone
+IMPORTANTE: dia/turno vêm da coluna "data" (quando o item foi observado de
+verdade no Access, linha a linha) — não de "atualizado_em" (que só diz
+quando a linha chegou no Postgres; a tabela inteira foi carregada de uma vez
+só, então "atualizado_em" é quase o mesmo valor pra mais de 1 milhão de
+linhas e não serve pra separar por dia — foi esse o bug real que fez o
+dashboard só mostrar "hoje" mesmo com semanas de histórico na tabela)."""
+
+from datetime import datetime, timedelta
 
 from scripts.sync_postgres_pausados import (
-    _assign_shifts,
     _dedupe_flat_rows,
+    _shift_from_hour,
     _status_to_ativo_pausado,
     build_cube_and_history,
     build_flat_rows,
     merge_payload,
 )
 
-BRT = timezone(timedelta(hours=-3))
-SAMPLE_TS = datetime(2026, 9, 10, 14, 48, 29, 95000, tzinfo=BRT)
+# "data" é timestamp SEM timezone (hora local já, vinda do Access).
+SAMPLE_DATA = datetime(2026, 9, 10, 14, 48, 29)
 
 
-def _pg_row(loja, categoria, item, status, price, ts=SAMPLE_TS, catalog_available=True):
+def _pg_row(loja, categoria, item, status, price, data=SAMPLE_DATA, catalog_available=True):
     return {
         "lojas_simple_name": loja,
         "categories_name": categoria,
         "rows_name": item,
         "status": status,
         "price_value": price,
-        "atualizado_em": ts,
+        "data": data,
         "status_by_catalog_available": catalog_available,  # ignorado de propósito, ver comentário no script
     }
 
 
-# Amostra real colada pelo usuário (Caipira - Bauru / Campo Limpo SP, 2026-09-10 14:48:29 -0300).
+# Amostra real colada pelo usuário (Caipira - Bauru / Campo Limpo SP, observada em 2026-09-10 14:48).
 SAMPLE_ROWS = [
     _pg_row("Caipira - Comida Brasileira - Bauru", "Domingo em Familia I Para Compartilhar",
             "Vaca Atolada I Tamanho Familia (3 a 4 pessoas)", "Ativo", 120.90),
@@ -73,23 +80,15 @@ def test_status_mapping_direto():
     assert _status_to_ativo_pausado(None) == "Pausado"
 
 
-def test_turno_com_um_unico_lote_no_dia_usa_regra_hora_17h():
-    # Toda a amostra tem o mesmo atualizado_em (14:48 -03:00) => 1 lote só
-    # nesse dia => cai na regra hora<17h (igual main.py) => Almoço.
-    shifts = _assign_shifts(SAMPLE_ROWS)
-    assert set(shifts.values()) == {"Almoço"}
-
-
-def test_turno_com_dois_lotes_no_mesmo_dia_ordena_almoco_e_jantar():
-    cedo = datetime(2026, 9, 10, 12, 0, 0, tzinfo=BRT)
-    tarde = datetime(2026, 9, 10, 19, 30, 0, tzinfo=BRT)
-    rows = [
-        _pg_row("Loja X", "Cat", "Item 1", "Ativo", 10, ts=cedo),
-        _pg_row("Loja X", "Cat", "Item 2", "Ativo", 10, ts=tarde),
-    ]
-    shifts = _assign_shifts(rows)
-    assert shifts[cedo] == "Almoço"
-    assert shifts[tarde] == "Jantar"
+def test_shift_from_hour_usa_regra_17h():
+    # Mesmo critério já usado em outro lugar do backend
+    # (main.py: shift = 'Almoço' if now.hour < 17 else 'Jantar').
+    assert _shift_from_hour(0) == "Almoço"
+    assert _shift_from_hour(11) == "Almoço"
+    assert _shift_from_hour(16) == "Almoço"
+    assert _shift_from_hour(17) == "Jantar"
+    assert _shift_from_hour(20) == "Jantar"
+    assert _shift_from_hour(23) == "Jantar"
 
 
 def test_build_flat_rows_preserva_contagem_e_status():
@@ -103,10 +102,9 @@ def test_build_flat_rows_preserva_contagem_e_status():
     assert len(pausados) == 3  # Rango da Semana, Queima do Alho, Monte o Seu
     assert len(ativos) == 12
 
-    # data usada é a do sync (atualizado_em), NUNCA a coluna `data` (que é
-    # metadado de quando o item foi editado no iFood, não da observação).
+    # dia/turno vêm de "data" (observação real), não de "atualizado_em".
     assert all(row["dia"] == "2026-09-10" for row in flat_rows)
-    assert all(row["shift"] == "Almoço" for row in flat_rows)
+    assert all(row["shift"] == "Almoço" for row in flat_rows)  # 14h48 < 17h
 
     queima_do_alho = next(row for row in flat_rows if row["item"] == "Queima do Alho")
     assert queima_do_alho["status"] == "Pausado"
@@ -228,25 +226,27 @@ def test_merge_payload_aplica_retencao_de_45_dias():
 
 def test_dedupe_flat_rows_colapsa_lotes_repetidos_mantendo_o_mais_recente():
     # O Postgres não faz upsert (confirmado pelo usuário: "sempre insere dados
-    # novos"), então o mesmo item pode aparecer em vários lotes de
-    # sincronização no mesmo dia/turno. Sem dedupe, build_cube_and_history
-    # conta cada repetição como um item a mais — foi o bug real que inflou o
-    # catalogCube pra mais de 1 milhão de registros e deixou o dashboard lento.
-    cedo = datetime(2026, 9, 10, 12, 0, 0, tzinfo=BRT)  # único lote da manhã -> Almoço
-    tarde = datetime(2026, 9, 10, 19, 0, 0, tzinfo=BRT)  # 2o lote do dia -> Jantar
-    mais_tarde = datetime(2026, 9, 10, 20, 0, 0, tzinfo=BRT)  # 3o lote do dia -> também Jantar
+    # novos"), então o mesmo item pode aparecer várias vezes no mesmo dia (o
+    # estoque acaba, pausa; chega carga nova, ativa de novo — normal). Sem
+    # dedupe, build_cube_and_history conta cada repetição como um item a
+    # mais — foi o bug real que inflou o catalogCube pra mais de 1 milhão de
+    # registros e deixou o dashboard lento.
+    cedo = datetime(2026, 9, 10, 12, 0, 0)  # manhã -> Almoço
+    tarde = datetime(2026, 9, 10, 19, 0, 0)  # 2a observação do dia -> Jantar
+    mais_tarde = datetime(2026, 9, 10, 20, 0, 0)  # 3a observação do dia -> também Jantar
     rows = [
-        _pg_row("Loja X", "Cat", "Item 1", "Ativo", 10, ts=cedo),
-        _pg_row("Loja X", "Cat", "Item 1", "Pausado", 10, ts=tarde),
-        _pg_row("Loja X", "Cat", "Item 1", "Ativo", 12, ts=mais_tarde),
+        _pg_row("Loja X", "Cat", "Item 1", "Ativo", 10, data=cedo),
+        _pg_row("Loja X", "Cat", "Item 1", "Pausado", 10, data=tarde),
+        _pg_row("Loja X", "Cat", "Item 1", "Ativo", 12, data=mais_tarde),
     ]
     flat_rows, _ = build_flat_rows(rows)
-    assert len(flat_rows) == 3  # ainda sem dedupe: uma linha por lote bruto
+    assert len(flat_rows) == 3  # ainda sem dedupe: uma linha por observação bruta
 
     deduped = _dedupe_flat_rows(flat_rows)
-    # os dois lotes de Jantar colapsam numa linha só, com o valor mais
-    # recente (mais_tarde: Ativo, 12) vencendo — igual ao "o novo vence" já
-    # usado no resto do script (merge_payload, _merge_catalog_cube).
+    # as duas observações de Jantar (mesmo dia, mesmo turno) colapsam numa
+    # linha só, com a mais recente (mais_tarde: Ativo, 12) vencendo — igual
+    # ao "o novo vence" já usado no resto do script (merge_payload,
+    # _merge_catalog_cube).
     assert len(deduped) == 2
     jantar = next(r for r in deduped if r["shift"] == "Jantar")
     assert jantar["status"] == "Ativo"
@@ -254,21 +254,54 @@ def test_dedupe_flat_rows_colapsa_lotes_repetidos_mantendo_o_mais_recente():
 
 
 def test_dedupe_evita_inflar_totais_do_network_history():
-    cedo = datetime(2026, 9, 10, 12, 0, 0, tzinfo=BRT)
-    tarde = datetime(2026, 9, 10, 19, 0, 0, tzinfo=BRT)
-    mais_tarde = datetime(2026, 9, 10, 20, 0, 0, tzinfo=BRT)
-    # 3 lotes do MESMO item, mas só 2 combinações reais (loja,item,dia,turno)
-    # distintas: Almoço (1 lote) e Jantar (2 lotes repetidos).
+    cedo = datetime(2026, 9, 10, 12, 0, 0)
+    tarde = datetime(2026, 9, 10, 19, 0, 0)
+    mais_tarde = datetime(2026, 9, 10, 20, 0, 0)
+    # 3 observações do MESMO item, mas só 2 combinações reais (loja,item,dia,
+    # turno) distintas: Almoço (1) e Jantar (2 repetidas).
     rows = [
-        _pg_row("Loja X", "Cat", "Item 1", "Ativo", 10, ts=cedo),
-        _pg_row("Loja X", "Cat", "Item 1", "Pausado", 10, ts=tarde),
-        _pg_row("Loja X", "Cat", "Item 1", "Pausado", 10, ts=mais_tarde),
+        _pg_row("Loja X", "Cat", "Item 1", "Ativo", 10, data=cedo),
+        _pg_row("Loja X", "Cat", "Item 1", "Pausado", 10, data=tarde),
+        _pg_row("Loja X", "Cat", "Item 1", "Pausado", 10, data=mais_tarde),
     ]
     flat_rows, _ = build_flat_rows(rows)
     extra = build_cube_and_history(_dedupe_flat_rows(flat_rows))
 
     # 2 entradas de networkHistory (Almoço e Jantar), cada uma com totalItems=1
-    # — não 3, que é o que dava antes da dedupe (uma repetição por lote).
+    # — não 3, que é o que dava antes da dedupe (uma repetição por observação).
     assert len(extra["networkHistory"]) == 2
     assert all(entry["totalItems"] == 1 for entry in extra["networkHistory"])
     assert len(extra["catalogCube"]["records"]) == 2
+
+
+def test_dias_diferentes_do_mesmo_item_nao_sao_tratados_como_conflito():
+    # Reproduz o caso real que o usuário mostrou: o item "Monte o Seu!", na
+    # mesma loja, aparece em dias DIFERENTES (campo "data") com status
+    # diferente. Isso é normal — estoque muda dia a dia — e cada dia deve
+    # virar sua própria linha, sem ser tratado como inconsistência.
+    rows = [
+        _pg_row("Fast-Food Caipira - Barretos", "Cat", "Monte o Seu!", "Pausado", 10,
+                data=datetime(2026, 9, 3, 12, 9, 46)),
+        _pg_row("Fast-Food Caipira - Barretos", "Cat", "Monte o Seu!", "Pausado", 10,
+                data=datetime(2026, 9, 3, 18, 4, 26)),
+        _pg_row("Fast-Food Caipira - Barretos", "Cat", "Monte o Seu!", "Ativo", 10,
+                data=datetime(2026, 8, 19, 17, 25, 54)),
+    ]
+    flat_rows, _ = build_flat_rows(rows)
+    deduped = _dedupe_flat_rows(flat_rows)
+
+    por_dia_turno = {(row["dia"], row["shift"]): row["status"] for row in deduped}
+    assert por_dia_turno == {
+        ("2026-09-03", "Almoço"): "Pausado",
+        ("2026-09-03", "Jantar"): "Pausado",
+        ("2026-08-19", "Jantar"): "Ativo",
+    }
+
+
+def test_build_flat_rows_ignora_linha_sem_data():
+    # "data" é a fonte da verdade pro dia/turno — sem ela, não dá pra saber
+    # quando o item foi observado, então a linha é descartada (não vira
+    # "hoje" por padrão, o que mascararia o problema).
+    rows = [_pg_row("Loja X", "Cat", "Item 1", "Ativo", 10, data=None)]
+    flat_rows, _ = build_flat_rows(rows)
+    assert flat_rows == []
