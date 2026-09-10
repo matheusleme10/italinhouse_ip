@@ -170,6 +170,24 @@ def build_flat_rows(pg_rows: list[dict]) -> tuple[list[dict], list[str]]:
     return flat_rows, sorted(unknown_status)
 
 
+def _dedupe_flat_rows(flat_rows: list[dict]) -> list[dict]:
+    """A tabela do Postgres não faz upsert — cada sincronização Access -> Postgres
+    insere linhas novas sem apagar as antigas, então a mesma combinação
+    (loja, item, dia, turno) pode aparecer dezenas ou centenas de vezes na
+    janela de leitura (uma vez por lote de sincronização). Sem isso,
+    build_cube_and_history conta cada duplicata como um item a mais (inflando
+    totalItems/pausedItems) e o catalogCube fica com um registro por linha
+    bruta em vez de um por combinação — foi isso que deixou o payload gigante
+    e o dashboard lento. Como pg_rows já vem ORDER BY atualizado_em, a última
+    ocorrência de cada chave é sempre o estado mais recente, então bastar
+    sobrescrever por chave já preserva 'o valor mais novo vence'."""
+    deduped: dict[str, dict] = {}
+    for row in flat_rows:
+        key = f"{row['loja']}|{row['categoria']}|{row['item']}|{row['dia']}|{row['shift']}"
+        deduped[key] = row
+    return list(deduped.values())
+
+
 # ---------------------------------------------------------------------------
 # 2) catalogCube + networkHistory + unitHistory
 #    (mesmo formato/algoritmo de src/utils/pivot-cache.js::parsePivotCatalog)
@@ -482,6 +500,15 @@ def main() -> int:
     flat_rows, unknown_status = build_flat_rows(pg_rows)
     if unknown_status:
         print(f"[aviso] valores de status não reconhecidos (tratados como Pausado): {unknown_status}")
+    linhas_brutas = len(flat_rows)
+    flat_rows = _dedupe_flat_rows(flat_rows)
+    if linhas_brutas != len(flat_rows):
+        print(
+            f"  {linhas_brutas} linha(s) bruta(s) do Postgres -> "
+            f"{len(flat_rows)} combinação(ões) única(s) de loja+item+dia+turno "
+            "(Postgres não faz upsert, então cada lote de sincronização insere "
+            "linhas repetidas — mantivemos sempre a mais recente)."
+        )
     extra = build_cube_and_history(flat_rows)
     print(
         f"  {len(extra['catalogCube']['stores'])} loja(s), "

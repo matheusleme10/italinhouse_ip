@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from scripts.sync_postgres_pausados import (
     _assign_shifts,
+    _dedupe_flat_rows,
     _status_to_ativo_pausado,
     build_cube_and_history,
     build_flat_rows,
@@ -223,3 +224,51 @@ def test_merge_payload_aplica_retencao_de_45_dias():
     dias = {row["dia"] for row in merged["rows"]}
     assert velho not in dias  # fora da janela de 45 dias, foi descartado
     assert "2026-09-10" in dias
+
+
+def test_dedupe_flat_rows_colapsa_lotes_repetidos_mantendo_o_mais_recente():
+    # O Postgres não faz upsert (confirmado pelo usuário: "sempre insere dados
+    # novos"), então o mesmo item pode aparecer em vários lotes de
+    # sincronização no mesmo dia/turno. Sem dedupe, build_cube_and_history
+    # conta cada repetição como um item a mais — foi o bug real que inflou o
+    # catalogCube pra mais de 1 milhão de registros e deixou o dashboard lento.
+    cedo = datetime(2026, 9, 10, 12, 0, 0, tzinfo=BRT)  # único lote da manhã -> Almoço
+    tarde = datetime(2026, 9, 10, 19, 0, 0, tzinfo=BRT)  # 2o lote do dia -> Jantar
+    mais_tarde = datetime(2026, 9, 10, 20, 0, 0, tzinfo=BRT)  # 3o lote do dia -> também Jantar
+    rows = [
+        _pg_row("Loja X", "Cat", "Item 1", "Ativo", 10, ts=cedo),
+        _pg_row("Loja X", "Cat", "Item 1", "Pausado", 10, ts=tarde),
+        _pg_row("Loja X", "Cat", "Item 1", "Ativo", 12, ts=mais_tarde),
+    ]
+    flat_rows, _ = build_flat_rows(rows)
+    assert len(flat_rows) == 3  # ainda sem dedupe: uma linha por lote bruto
+
+    deduped = _dedupe_flat_rows(flat_rows)
+    # os dois lotes de Jantar colapsam numa linha só, com o valor mais
+    # recente (mais_tarde: Ativo, 12) vencendo — igual ao "o novo vence" já
+    # usado no resto do script (merge_payload, _merge_catalog_cube).
+    assert len(deduped) == 2
+    jantar = next(r for r in deduped if r["shift"] == "Jantar")
+    assert jantar["status"] == "Ativo"
+    assert jantar["precoNum"] == 12
+
+
+def test_dedupe_evita_inflar_totais_do_network_history():
+    cedo = datetime(2026, 9, 10, 12, 0, 0, tzinfo=BRT)
+    tarde = datetime(2026, 9, 10, 19, 0, 0, tzinfo=BRT)
+    mais_tarde = datetime(2026, 9, 10, 20, 0, 0, tzinfo=BRT)
+    # 3 lotes do MESMO item, mas só 2 combinações reais (loja,item,dia,turno)
+    # distintas: Almoço (1 lote) e Jantar (2 lotes repetidos).
+    rows = [
+        _pg_row("Loja X", "Cat", "Item 1", "Ativo", 10, ts=cedo),
+        _pg_row("Loja X", "Cat", "Item 1", "Pausado", 10, ts=tarde),
+        _pg_row("Loja X", "Cat", "Item 1", "Pausado", 10, ts=mais_tarde),
+    ]
+    flat_rows, _ = build_flat_rows(rows)
+    extra = build_cube_and_history(_dedupe_flat_rows(flat_rows))
+
+    # 2 entradas de networkHistory (Almoço e Jantar), cada uma com totalItems=1
+    # — não 3, que é o que dava antes da dedupe (uma repetição por lote).
+    assert len(extra["networkHistory"]) == 2
+    assert all(entry["totalItems"] == 1 for entry in extra["networkHistory"])
+    assert len(extra["catalogCube"]["records"]) == 2
