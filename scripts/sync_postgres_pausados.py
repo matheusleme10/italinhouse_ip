@@ -14,11 +14,17 @@ manual continua funcionando normalmente, como alternativa/backup.
 Pensado para rodar 2x ao dia via GitHub Actions
 (.github/workflows/sync-postgres.yml), mas também roda manualmente:
 
-    DATABASE_URL=... DASHBOARD_PUBLIC_URL=... DASHBOARD_ADMIN_PASSWORD=... \
+    DB_HOST=... DB_PORT=... DB_NAME=... DB_USER=... DB_PASSWORD=... \
+    DASHBOARD_PUBLIC_URL=... DASHBOARD_ADMIN_PASSWORD=... \
         python scripts/sync_postgres_pausados.py [--dry-run]
 
 Variáveis de ambiente (ver .env.local.example):
-    DATABASE_URL              — connection string do Postgres (schema dados_ifood).
+    DB_HOST                   — host do Postgres (schema dados_ifood, tabela produtos_pausados).
+    DB_PORT                   — porta do Postgres (opcional, padrão 5432).
+    DB_NAME                   — nome do banco.
+    DB_USER                   — usuário do banco.
+    DB_PASSWORD               — senha do banco.
+    DB_SSLMODE                — modo SSL (opcional; defina "require" se o provedor exigir).
     DASHBOARD_PUBLIC_URL       — URL pública do dashboard (a mesma já usada no aviso por e-mail).
     DASHBOARD_ADMIN_PASSWORD   — senha de admin em texto puro (para logar via POST /api/session;
                                   diferente de ADMIN_PASSWORD_HASH, que é o hash usado pelo backend).
@@ -72,7 +78,24 @@ def _env(name: str, required: bool = True, default: str = "") -> str:
 # 1) Leitura do Postgres
 # ---------------------------------------------------------------------------
 
-def fetch_postgres_rows(database_url: str) -> list[dict]:
+def _pg_connection_kwargs() -> dict:
+    """Variáveis separadas em vez de uma DATABASE_URL inline — evita o erro de
+    parsing (aspas ou espaço sobrando) ao colar uma connection string inteira
+    dentro de um secret do GitHub, que foi exatamente o que quebrou antes."""
+    kwargs = {
+        "host": _env("DB_HOST"),
+        "port": _env("DB_PORT", required=False, default="5432"),
+        "dbname": _env("DB_NAME"),
+        "user": _env("DB_USER"),
+        "password": _env("DB_PASSWORD"),
+    }
+    sslmode = _env("DB_SSLMODE", required=False, default="")
+    if sslmode:
+        kwargs["sslmode"] = sslmode
+    return kwargs
+
+
+def fetch_postgres_rows(pg_kwargs: dict) -> list[dict]:
     since = datetime.now(timezone.utc) - timedelta(days=POSTGRES_LOOKBACK_DAYS)
     query = """
         SELECT lojas_simple_name, categories_name, rows_name, status, price_value, atualizado_em
@@ -80,7 +103,7 @@ def fetch_postgres_rows(database_url: str) -> list[dict]:
         WHERE atualizado_em >= %s
         ORDER BY atualizado_em
     """
-    with psycopg2.connect(database_url) as conn:
+    with psycopg2.connect(**pg_kwargs) as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(query, (since,))
             return list(cur.fetchall())
@@ -445,12 +468,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    database_url = _env("DATABASE_URL")
+    pg_kwargs = _pg_connection_kwargs()
     base_url = _env("DASHBOARD_PUBLIC_URL").rstrip("/")
     admin_password = _env("DASHBOARD_ADMIN_PASSWORD")
 
     print(f"Buscando linhas dos últimos {POSTGRES_LOOKBACK_DAYS} dias no Postgres...")
-    pg_rows = fetch_postgres_rows(database_url)
+    pg_rows = fetch_postgres_rows(pg_kwargs)
     if not pg_rows:
         print("Nenhuma linha encontrada no Postgres nessa janela — nada a sincronizar.")
         return 0
