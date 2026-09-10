@@ -1,0 +1,6 @@
+# Dependências dos scripts standalone em scripts/ (não fazem parte do
+# backend implantado na Vercel — esse continua usando o requirements.txt
+# da raiz do projeto).
+psycopg2-binary==2.9.9
+requests==2.32.3
+python-dotenv==1.1.1

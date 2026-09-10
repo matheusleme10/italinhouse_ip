@@ -1,0 +1,38 @@
+name: Sincronizar itens pausados do Postgres
+
+# Roda 2x ao dia e chama scripts/sync_postgres_pausados.py, que loga como
+# admin no dashboard e sobe os dados mais recentes do Postgres — igual a um
+# upload manual, só que automático. O upload manual continua funcionando
+# normalmente como alternativa/backup.
+#
+# Horários abaixo em UTC (o GitHub Actions só agenda em UTC). Brasil (BRT) é
+# UTC-3, então "0 15 * * *" = 12:00 no horário de Brasília e "0 22 * * *" =
+# 19:00 no horário de Brasília. Ajuste os dois horários abaixo para bater
+# com os horários reais da sincronização Access -> Postgres.
+on:
+  schedule:
+    - cron: "0 15 * * *" # ~12:00 BRT
+    - cron: "0 22 * * *" # ~19:00 BRT
+  workflow_dispatch: {} # permite rodar manualmente pela aba Actions no GitHub
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências do script
+        run: pip install -r scripts/requirements.txt
+
+      - name: Sincronizar
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DASHBOARD_PUBLIC_URL: ${{ secrets.DASHBOARD_PUBLIC_URL }}
+          DASHBOARD_ADMIN_PASSWORD: ${{ secrets.DASHBOARD_ADMIN_PASSWORD }}
+        run: python scripts/sync_postgres_pausados.py
