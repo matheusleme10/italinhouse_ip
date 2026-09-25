@@ -220,6 +220,30 @@ LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 LAST_NOTIFICATION: dict = {"status": "never", "sentAt": None, "emailCount": 0, "whatsappCount": 0}
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+# Botão admin "Atualizar dados" — dispara o workflow_dispatch do GitHub
+# Actions (mesmo workflow do sync automático, .github/workflows/sync-postgres.yml)
+# a partir do backend, nunca do navegador: o PAT do GitHub só existe aqui,
+# como variável de ambiente do servidor (GITHUB_SYNC_TOKEN). O frontend nunca
+# vê esse token — só chama POST /api/data/sync-now, que está atrás de
+# require_session("admin").
+GITHUB_SYNC_TOKEN = os.getenv("GITHUB_SYNC_TOKEN", "").strip()
+GITHUB_SYNC_REPO = os.getenv("GITHUB_SYNC_REPO", "matheusleme10/italinhouse_ip").strip()
+GITHUB_SYNC_WORKFLOW = os.getenv("GITHUB_SYNC_WORKFLOW", "sync-postgres.yml").strip()
+GITHUB_SYNC_REF = os.getenv("GITHUB_SYNC_REF", "main").strip()
+SYNC_TRIGGER_COOLDOWN_SECONDS = 120
+SYNC_TRIGGER_STATE: dict = {
+    "lastTriggeredAt": 0.0,
+    "inFlight": False,
+    "lastTriggeredBy": None,
+    # Preenchidos em trigger_sync_now e lidos em sync_trigger_status pra
+    # acompanhar o run real do GitHub Actions (ver _find_matching_run /
+    # _map_run_status_to_outcome). triggeredAtIso é o carimbo do disparo;
+    # uploadedAtAtTrigger é o uploadedAt do payload ANTES do disparo, usado
+    # só pra distinguir "concluiu sem dado novo" de "concluiu com dado novo".
+    "triggeredAtIso": None,
+    "uploadedAtAtTrigger": None,
+}
+
 
 def _session_secret() -> bytes:
     secret = os.getenv("SESSION_SECRET", "").strip()
@@ -1306,6 +1330,208 @@ async def upload_compressed_data(request: Request) -> dict:
         raise HTTPException(status_code=503, detail=str(error)) from error
     notification = await maybe_send_notifications(payload)
     return {"success": True, "totalRows": len(rows), "notification": notification}
+
+
+def _find_matching_run(runs: list[dict], triggered_at: datetime, ref: str) -> dict | None:
+    """Entre os runs recentes do workflow, acha o que corresponde ao nosso
+    disparo — melhor esforço, já que workflow_dispatch responde 204 sem
+    devolver run_id (não existe, nessa arquitetura, um identificador forte
+    pra correlacionar; o workflow atual não tem inputs customizados que
+    poderiam carregar um token único). Critério: event=workflow_dispatch,
+    mesma branch/ref configurada, e created_at >= triggered_at — dentre os
+    que sobram, o mais antigo (o run criado logo depois do nosso POST).
+    Risco conhecido e documentado: dois disparos manuais (nosso botão e/ou
+    a aba Actions do GitHub) muito próximos no tempo podem, em tese, ser
+    confundidos — não há como diferenciar sem um input customizado no
+    workflow."""
+    candidates: list[tuple[datetime, dict]] = []
+    for run in runs:
+        if run.get("event") != "workflow_dispatch":
+            continue
+        if run.get("head_branch") != ref:
+            continue
+        created_raw = run.get("created_at")
+        if not created_raw:
+            continue
+        try:
+            created_at = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if created_at < triggered_at:
+            continue
+        candidates.append((created_at, run))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: pair[0])
+    return candidates[0][1]
+
+
+def _map_run_status_to_outcome(
+    run: dict | None,
+    uploaded_at_at_trigger: str | None,
+    current_uploaded_at: str | None,
+) -> str:
+    """Traduz o status do run do GitHub Actions pro vocabulário do frontend.
+    Nunca inventa "updated"/"no_new_data" sem um run 'completed' de verdade —
+    enquanto o run não é encontrado (ainda não apareceu na listagem) ou está
+    queued/waiting/pending, é 'requested'; em execução é 'running'; só depois
+    de 'completed' é que olhamos a conclusão e o uploadedAt pra decidir entre
+    'failed', 'updated' e 'no_new_data'."""
+    if run is None:
+        return "requested"
+    status = str(run.get("status") or "").lower()
+    if status in ("queued", "waiting", "pending", "requested"):
+        return "requested"
+    if status == "in_progress":
+        return "running"
+    if status == "completed":
+        conclusion = str(run.get("conclusion") or "").lower()
+        if conclusion != "success":
+            return "failed"
+        if current_uploaded_at and current_uploaded_at != uploaded_at_at_trigger:
+            return "updated"
+        return "no_new_data"
+    # Status que o GitHub venha a introduzir e que não conhecemos ainda —
+    # tratamos como "ainda em andamento" em vez de arriscar uma conclusão
+    # errada.
+    return "requested"
+
+
+async def _fetch_recent_workflow_runs(http_client: httpx.AsyncClient) -> list[dict]:
+    response = await http_client.get(
+        f"https://api.github.com/repos/{GITHUB_SYNC_REPO}/actions/workflows/{GITHUB_SYNC_WORKFLOW}/runs",
+        headers={
+            "Authorization": f"Bearer {GITHUB_SYNC_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        params={"event": "workflow_dispatch", "branch": GITHUB_SYNC_REF, "per_page": 10},
+    )
+    response.raise_for_status()
+    return response.json().get("workflow_runs", [])
+
+
+@app.post("/api/data/sync-now")
+async def trigger_sync_now(request: Request) -> dict:
+    """Dispara manualmente o workflow_dispatch do sync-postgres.yml (mesmo
+    workflow do cron automático de 15:20/20:20 BRT). Só admin, com cooldown
+    para não deixar clique duplo/repetido disparar várias execuções ao mesmo
+    tempo. O GitHub só confirma que ACEITOU o disparo (204) — não que o sync
+    já terminou; guardamos triggeredAt + o uploadedAt de agora (antes do
+    disparo) pra GET /api/data/sync-status conseguir acompanhar o run real
+    depois (ver _find_matching_run / _map_run_status_to_outcome)."""
+    if require_session(request) != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores podem disparar a sincronização.")
+    if not GITHUB_SYNC_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="GITHUB_SYNC_TOKEN não configurado no backend — configure a variável de ambiente para habilitar este botão.",
+        )
+    now = time.time()
+    if SYNC_TRIGGER_STATE["inFlight"]:
+        raise HTTPException(status_code=429, detail="Já existe uma solicitação de sincronização em andamento.")
+    elapsed = now - SYNC_TRIGGER_STATE["lastTriggeredAt"]
+    if elapsed < SYNC_TRIGGER_COOLDOWN_SECONDS:
+        wait = int(SYNC_TRIGGER_COOLDOWN_SECONDS - elapsed) + 1
+        raise HTTPException(
+            status_code=429,
+            detail=f"Aguarde {wait}s antes de disparar a sincronização de novo.",
+            headers={"Retry-After": str(wait)},
+        )
+
+    # Carimbo ANTES do POST de dispatch — representa o estado "como estava"
+    # no momento do clique, pra depois sabermos se um run 'completed com
+    # sucesso' de fato trouxe dado novo ou não.
+    triggered_at_dt = datetime.now(timezone.utc)
+    uploaded_at_before = (await read_current_payload() or {}).get("uploadedAt")
+
+    SYNC_TRIGGER_STATE["inFlight"] = True
+    try:
+        async with httpx.AsyncClient(timeout=20) as http_client:
+            response = await http_client.post(
+                f"https://api.github.com/repos/{GITHUB_SYNC_REPO}/actions/workflows/{GITHUB_SYNC_WORKFLOW}/dispatches",
+                headers={
+                    "Authorization": f"Bearer {GITHUB_SYNC_TOKEN}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                json={"ref": GITHUB_SYNC_REF},
+            )
+        if response.status_code not in (201, 204):
+            raise HTTPException(
+                status_code=502,
+                detail=f"O GitHub recusou o disparo do workflow (status {response.status_code}).",
+            )
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=502, detail="Não foi possível contatar o GitHub Actions.") from error
+    finally:
+        SYNC_TRIGGER_STATE["inFlight"] = False
+
+    # O 204 do dispatch só significa "o GitHub aceitou e colocou na fila" —
+    # por isso guardamos como 'requested', nunca como concluído.
+    SYNC_TRIGGER_STATE["lastTriggeredAt"] = now
+    SYNC_TRIGGER_STATE["triggeredAtIso"] = triggered_at_dt.isoformat()
+    SYNC_TRIGGER_STATE["uploadedAtAtTrigger"] = uploaded_at_before
+    return {
+        "success": True,
+        "triggeredAt": SYNC_TRIGGER_STATE["triggeredAtIso"],
+        "cooldownSeconds": SYNC_TRIGGER_COOLDOWN_SECONDS,
+    }
+
+
+@app.get("/api/data/sync-status")
+async def sync_trigger_status(request: Request) -> dict:
+    if require_session(request) != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores podem consultar o status.")
+    elapsed = time.time() - SYNC_TRIGGER_STATE["lastTriggeredAt"] if SYNC_TRIGGER_STATE["lastTriggeredAt"] else None
+    cooldown_remaining = (
+        max(0, int(SYNC_TRIGGER_COOLDOWN_SECONDS - elapsed)) if elapsed is not None else 0
+    )
+    base = {
+        "configured": bool(GITHUB_SYNC_TOKEN),
+        "inFlight": SYNC_TRIGGER_STATE["inFlight"],
+        "cooldownRemaining": cooldown_remaining,
+        "lastTriggeredAt": (
+            datetime.fromtimestamp(SYNC_TRIGGER_STATE["lastTriggeredAt"], tz=timezone.utc).isoformat()
+            if SYNC_TRIGGER_STATE["lastTriggeredAt"] else None
+        ),
+    }
+
+    triggered_at_iso = SYNC_TRIGGER_STATE.get("triggeredAtIso")
+    if not triggered_at_iso:
+        # Nunca disparado (ou processo reiniciado) — não há nada pra
+        # acompanhar; outcome None é o estado "idle" pro frontend.
+        return {**base, "outcome": None, "runId": None, "runUrl": None}
+
+    try:
+        triggered_at = datetime.fromisoformat(triggered_at_iso)
+    except ValueError:
+        return {**base, "outcome": None, "runId": None, "runUrl": None}
+
+    if not GITHUB_SYNC_TOKEN:
+        return {**base, "outcome": "requested", "runId": None, "runUrl": None}
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as http_client:
+            runs = await _fetch_recent_workflow_runs(http_client)
+    except httpx.HTTPError:
+        # Não conseguimos consultar o GitHub agora — não inventamos
+        # conclusão nenhuma (nem sucesso, nem no_new_data): devolvemos um
+        # estado indeterminado explícito, pro frontend não travar
+        # silenciosamente nem assumir algo que não confirmamos.
+        return {**base, "outcome": "unknown", "runId": None, "runUrl": None}
+
+    matching_run = _find_matching_run(runs, triggered_at, GITHUB_SYNC_REF)
+    current_uploaded_at = (await read_current_payload() or {}).get("uploadedAt")
+    outcome = _map_run_status_to_outcome(
+        matching_run, SYNC_TRIGGER_STATE.get("uploadedAtAtTrigger"), current_uploaded_at,
+    )
+    return {
+        **base,
+        "outcome": outcome,
+        "runId": matching_run.get("id") if matching_run else None,
+        "runUrl": matching_run.get("html_url") if matching_run else None,
+    }
 
 
 @app.post("/api/data")

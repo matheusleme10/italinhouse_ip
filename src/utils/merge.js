@@ -18,9 +18,18 @@
  *    turno/dia que não está no arquivo atual. Agora o histórico é limitado a
  *    uma janela recente (RETENTION_DAYS), então o tamanho do pacote para de
  *    crescer indefinidamente.
+ *
+ * WINDOW_MONTHS = janela móvel de "últimos 3 meses-calendário" pedida para
+ * o dashboard, ancorada na maior data REAL disponível nos dados (calculada
+ * abaixo via maxDate), não em CURRENT_DATE. É uma subtração de MESES de
+ * calendário (ex.: MAX(data) = 25/09/2026 -> início = 25/06/2026), não uma
+ * janela fixa de 90 dias — meses têm 28 a 31 dias, então "3 meses" e "90
+ * dias" divergem na maioria dos casos. Mesma regra em
+ * scripts/sync_postgres_pausados.py (WINDOW_MONTHS) — não mude só aqui,
+ * mude nos dois lugares.
  */
 
-const RETENTION_DAYS = 45;
+const WINDOW_MONTHS = 3;
 
 function rowKey(r) {
   return `${r.loja}|${r.categoria}|${r.item}|${r.dia}|${r.shift || ''}`;
@@ -96,11 +105,24 @@ function maxDate(...lists) {
   return max || null;
 }
 
-function cutoffFrom(latest, days) {
+// Subtrai MESES de calendário (não dias) da data mais recente — ex.:
+// cutoffFrom('2026-09-25', 3) -> '2026-06-25'. Usamos setUTCDate(1) antes de
+// mover o mês para evitar o efeito colateral de "dia inexistente" do
+// JavaScript (ex.: 31/03 - 1 mês, sem esse cuidado, viraria 03/03 em vez de
+// 28/02, porque fevereiro não tem dia 31 e o Date "estoura" pro mês
+// seguinte); com o dia fixado em 1 durante o cálculo do mês, e só então
+// devolvido ao dia original, esse efeito não ocorre para nenhuma combinação
+// de dia/mês que aparece nos dados (dias 1-28, sempre válidos em qualquer
+// mês de destino).
+function cutoffFrom(latest, months) {
   if (!latest) return null;
   const date = new Date(`${latest}T00:00:00Z`);
   if (Number.isNaN(date.getTime())) return null;
-  date.setUTCDate(date.getUTCDate() - days);
+  const day = date.getUTCDate();
+  date.setUTCDate(1);
+  date.setUTCMonth(date.getUTCMonth() - months);
+  const lastDayOfTargetMonth = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0)).getUTCDate();
+  date.setUTCDate(Math.min(day, lastDayOfTargetMonth));
   return date.toISOString().slice(0, 10);
 }
 
@@ -166,7 +188,7 @@ export function mergeRows(existing, incoming) {
     catalogHistory.map((entry) => entry.dia),
     rows.map((row) => row.dia)
   );
-  const cutoff = cutoffFrom(latest, RETENTION_DAYS);
+  const cutoff = cutoffFrom(latest, WINDOW_MONTHS);
 
   if (cutoff) {
     rows = rows.filter((row) => !row.dia || row.dia >= cutoff);

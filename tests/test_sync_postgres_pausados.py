@@ -13,6 +13,9 @@ from datetime import datetime, timedelta
 
 from scripts.sync_postgres_pausados import (
     _dedupe_flat_rows,
+    _guard_allows_upload,
+    _latest_source_timestamp,
+    _previous_source_timestamp,
     _shift_from_hour,
     _status_to_ativo_pausado,
     build_cube_and_history,
@@ -204,10 +207,16 @@ def test_merge_payload_atualiza_linha_existente_sem_perder_historico_antigo():
     assert len(merged["rows"][0]["networkHistory"]) == 2
 
 
-def test_merge_payload_aplica_retencao_de_45_dias():
-    from scripts.sync_postgres_pausados import RETENTION_DAYS
-
-    velho = (datetime(2026, 9, 10) - timedelta(days=RETENTION_DAYS + 5)).date().isoformat()
+def test_merge_payload_aplica_janela_de_3_meses_calendario():
+    # SAMPLE_ROWS traz "2026-09-10" como a maior data real -> a janela deve
+    # cortar tudo antes de 2026-06-10 (3 meses-calendário atrás), não antes
+    # de "90 dias atrás" (2026-06-12). Um dia antigo o suficiente pra sair da
+    # janela de 90 dias mas ainda dentro da janela de 3 meses-calendário
+    # provaria a regra errada — aqui usamos um dia claramente fora dos dois
+    # critérios para não depender dessa diferença fina neste teste (ver
+    # test_cutoff_from_diverge_entre_90_dias_e_3_meses_calendario abaixo, que
+    # cobre exatamente esse caso-limite).
+    velho = "2026-05-01"
     current_payload = {
         "rows": [{
             "loja": "Loja Antiga", "categoria": "Cat", "item": "Item Antigo",
@@ -220,8 +229,41 @@ def test_merge_payload_aplica_retencao_de_45_dias():
     merged = merge_payload(current_payload, flat_rows, extra)
 
     dias = {row["dia"] for row in merged["rows"]}
-    assert velho not in dias  # fora da janela de 45 dias, foi descartado
+    assert velho not in dias  # fora da janela móvel de 3 meses-calendário, foi descartado
     assert "2026-09-10" in dias
+
+
+def test_cutoff_from_ancora_em_max_data_com_3_meses_calendario():
+    # Exemplo obrigatório do requisito: MAX(data) = 25/09/2026 -> início da
+    # janela = 25/06/2026 (3 meses-calendário atrás, mesmo dia do mês) — não
+    # 90 dias atrás (que seria 2026-06-27).
+    from scripts.sync_postgres_pausados import WINDOW_MONTHS, _cutoff_from
+
+    assert WINDOW_MONTHS == 3
+    assert _cutoff_from("2026-09-25", WINDOW_MONTHS) == "2026-06-25"
+
+
+def test_cutoff_from_diverge_entre_90_dias_e_3_meses_calendario():
+    # 2026-09-25 menos 90 dias corridos = 2026-06-27; menos 3 meses-calendário
+    # = 2026-06-25. As duas datas são diferentes — prova que a regra
+    # implementada é mesmo "3 meses de calendário" e não "90 dias" travestido.
+    from scripts.sync_postgres_pausados import _cutoff_from
+
+    cutoff_90_dias = (datetime(2026, 9, 25) - timedelta(days=90)).date().isoformat()
+    cutoff_3_meses = _cutoff_from("2026-09-25", 3)
+
+    assert cutoff_90_dias == "2026-06-27"
+    assert cutoff_3_meses == "2026-06-25"
+    assert cutoff_90_dias != cutoff_3_meses
+
+
+def test_cutoff_from_usa_ultimo_dia_valido_quando_mes_de_destino_e_mais_curto():
+    # 31/03 - 1 mês -> fevereiro não tem dia 31; deve cair no último dia
+    # válido de fevereiro (2026 não é bissexto -> 28), e não "estourar" pro
+    # início de março como o Python faria sem esse cuidado.
+    from scripts.sync_postgres_pausados import _cutoff_from
+
+    assert _cutoff_from("2026-03-31", 1) == "2026-02-28"
 
 
 def test_dedupe_flat_rows_colapsa_lotes_repetidos_mantendo_o_mais_recente():
@@ -376,3 +418,66 @@ def test_trim_payload_to_fit_nunca_fica_com_zero_dias():
 
     assert trimmed["totalRows"] >= 1
     assert len({r["dia"] for r in trimmed["rows"]}) == 1  # não corta o último dia que sobrou
+
+
+def test_latest_source_timestamp_ignora_linhas_sem_data():
+    pg_rows = [
+        {"data": datetime(2026, 9, 10, 12, 0, 0)},
+        {"data": datetime(2026, 9, 10, 20, 0, 0)},  # mais recente -> deve ser o resultado
+        {"data": None},
+    ]
+    assert _latest_source_timestamp(pg_rows) == datetime(2026, 9, 10, 20, 0, 0)
+    assert _latest_source_timestamp([{"data": None}]) is None
+
+
+def test_previous_source_timestamp_le_valor_salvo_no_payload():
+    payload = {"rows": [{"lastSourceDataAt": "2026-09-10T20:00:00"}]}
+    assert _previous_source_timestamp(payload) == datetime(2026, 9, 10, 20, 0, 0)
+    assert _previous_source_timestamp({"rows": []}) is None
+    assert _previous_source_timestamp({"rows": [{"lastSourceDataAt": "lixo"}]}) is None
+
+
+def test_guard_aceita_almoco_e_jantar_no_mesmo_dia():
+    # Caso obrigatório do requisito: publicado 25/09/2026 15:15, novo
+    # 25/09/2026 20:15 (mesmo dia, turno diferente) -> guard TEM que aceitar,
+    # porque compara o timestamp completo (data+hora), não só a data.
+    publicado = datetime(2026, 9, 25, 15, 15)
+    novo = datetime(2026, 9, 25, 20, 15)
+    assert _guard_allows_upload(publicado, novo, force=False) is True
+
+
+def test_guard_bloqueia_quando_novo_e_igual_ou_anterior_ao_publicado():
+    publicado = datetime(2026, 9, 25, 20, 15)
+    igual = datetime(2026, 9, 25, 20, 15)
+    anterior = datetime(2026, 9, 25, 15, 15)
+    assert _guard_allows_upload(publicado, igual, force=False) is False
+    assert _guard_allows_upload(publicado, anterior, force=False) is False
+
+
+def test_guard_force_ignora_a_comparacao():
+    publicado = datetime(2026, 9, 25, 20, 15)
+    anterior = datetime(2026, 9, 25, 15, 15)
+    assert _guard_allows_upload(publicado, anterior, force=True) is True
+
+
+def test_guard_permite_primeira_rodada_sem_snapshot_anterior():
+    novo = datetime(2026, 9, 25, 20, 15)
+    assert _guard_allows_upload(None, novo, force=False) is True
+
+
+def test_merge_payload_grava_lastsourcedataat_no_snapshot():
+    flat_rows, _ = build_flat_rows(SAMPLE_ROWS)
+    extra = build_cube_and_history(flat_rows)
+    current_payload = {"rows": [], "totalRows": 0}
+
+    merged = merge_payload(
+        current_payload, flat_rows, extra,
+        source_data_at="2026-09-10T14:48:29",
+    )
+    assert merged["rows"][0]["lastSourceDataAt"] == "2026-09-10T14:48:29"
+
+    # Uma rodada sem novidade (source_data_at=None) preserva o carimbo antigo
+    # em vez de apagá-lo — o guard de frescor depende disso pra funcionar
+    # mesmo depois de várias rodadas "sem novidade" em sequência.
+    merged_de_novo = merge_payload(merged, flat_rows, extra, source_data_at=None)
+    assert merged_de_novo["rows"][0]["lastSourceDataAt"] == "2026-09-10T14:48:29"

@@ -91,7 +91,10 @@ export async function saveDataRemote(rows, onProgress) {
 
 /**
  * Carrega todos os dados do Vercel Blob.
- * Retorna null se não houver dados remotos.
+ * Retorna null se não houver dados remotos, ou { rows, uploadedAt } — o
+ * "Sincronizado às" do indicador do sidebar vem de uploadedAt (quando o
+ * dashboard buscou/recebeu esse snapshot), bem diferente de "Dados até"
+ * (que é sobre o conteúdo em si, calculado a partir das linhas).
  */
 export async function loadDataRemote() {
   try {
@@ -100,9 +103,39 @@ export async function loadDataRemote() {
 
     const index = await res.json();
     if (!index.hasData || !Array.isArray(index.rows)) return null;
-    return index.rows;
+    return { rows: index.rows, uploadedAt: index.uploadedAt || null };
   } catch {
     return null; // Falha silenciosa — usa localStorage como fallback
+  }
+}
+
+/**
+ * Dispara o workflow_dispatch do sync-postgres.yml através do backend (o
+ * token do GitHub nunca sai do servidor — ver POST /api/data/sync-now em
+ * backend/main.py). Lança um Error com a mensagem do backend em caso de
+ * falha (inclui cooldown/429, não configurado/503, etc.) para o chamador
+ * decidir o que exibir.
+ */
+export async function triggerSyncNow() {
+  const res = await fetch(`${API}/sync-now`, { method: 'POST', credentials: 'same-origin' });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(body.detail || 'Falha ao solicitar a sincronização.');
+  }
+  return body;
+}
+
+/**
+ * Consulta o estado atual do disparo (em andamento / cooldown) — usado para
+ * já abrir o botão desabilitado se outra pessoa/aba disparou há pouco.
+ */
+export async function getSyncTriggerStatus() {
+  try {
+    const res = await fetch(`${API}/sync-status`, { credentials: 'same-origin', cache: 'no-store' });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
   }
 }
 

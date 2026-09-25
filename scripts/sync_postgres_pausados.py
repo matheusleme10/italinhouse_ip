@@ -21,7 +21,20 @@ Pensado para rodar 2x ao dia via GitHub Actions
 
     DB_HOST=... DB_PORT=... DB_NAME=... DB_USER=... DB_PASSWORD=... \
     DASHBOARD_PUBLIC_URL=... DASHBOARD_ADMIN_PASSWORD=... \
-        python scripts/sync_postgres_pausados.py [--dry-run]
+        python scripts/sync_postgres_pausados.py [--dry-run] [--force]
+
+Guard de frescor: antes de enviar, comparamos a maior "data" real lida agora
+com a maior "data" já publicada no dashboard (rows[0].lastSourceDataAt do
+snapshot atual). Se não houver nada mais novo, a rodada é abortada sem
+upload (evita substituir dados válidos por uma leitura sem novidade). Use
+--force para ignorar esse guard manualmente.
+
+Janela: o dashboard mantém uma janela móvel dos últimos WINDOW_MONTHS
+meses-calendário (hoje 3), ancorada na maior data REAL disponível nos dados
+(não em CURRENT_DATE) — ex.: MAX(data) = 25/09/2026 -> início = 25/06/2026.
+Isso é uma subtração de MESES de calendário, não de 90 dias fixos (meses têm
+28 a 31 dias, então os dois critérios divergem na maioria dos casos). Mesma
+constante em src/utils/merge.js — mude nos dois lugares.
 
 Variáveis de ambiente (ver .env.local.example):
     DB_HOST                   — host do Postgres (schema dados_ifood, tabela produtos_pausados).
@@ -36,11 +49,12 @@ Variáveis de ambiente (ver .env.local.example):
 """
 
 import argparse
+import calendar
 import gzip
 import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -54,7 +68,11 @@ load_dotenv(ROOT / ".env")
 load_dotenv(ROOT / ".env.local", override=True)
 
 BR_TZ = ZoneInfo("America/Sao_Paulo")
-RETENTION_DAYS = 45  # mesma janela usada em src/utils/merge.js — não mude só aqui, mude nos dois lugares.
+# Janela móvel de retenção do dashboard: "últimos 3 meses-calendário",
+# ancorada na maior data REAL disponível nos dados (não em CURRENT_DATE) —
+# ex.: MAX(data) = 25/09/2026 -> início = 25/06/2026. Mesma janela usada em
+# src/utils/merge.js (WINDOW_MONTHS). Não mude só aqui, mude nos dois lugares.
+WINDOW_MONTHS = 3
 POSTGRES_LOOKBACK_DAYS = 30  # quanto histórico buscar do Postgres a cada rodada (ajustável).
 
 # status "Ativo" no Postgres já vem quase sempre como "Ativo" (ver amostra real
@@ -346,17 +364,32 @@ def _max_date(*lists: list) -> str | None:
     return best or None
 
 
-def _cutoff_from(latest: str | None, days: int) -> str | None:
+def _cutoff_from(latest: str | None, months: int) -> str | None:
+    """Subtrai MESES de calendário (não dias) de `latest` — ex.:
+    _cutoff_from('2026-09-25', 3) -> '2026-06-25'. Espelha cutoffFrom em
+    src/utils/merge.js: quando o dia do mês não existe no mês de destino
+    (ex.: 31/03 - 1 mês -> fevereiro não tem dia 31), usamos o último dia
+    válido daquele mês em vez de deixar o Python "estourar" pro mês seguinte."""
     if not latest:
         return None
     try:
-        parsed = datetime.strptime(latest, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        parsed = datetime.strptime(latest, "%Y-%m-%d").date()
     except ValueError:
         return None
-    return (parsed - timedelta(days=days)).date().isoformat()
+    total_months = (parsed.year * 12 + (parsed.month - 1)) - months
+    year, month = divmod(total_months, 12)
+    month += 1
+    last_day_of_target_month = calendar.monthrange(year, month)[1]
+    day = min(parsed.day, last_day_of_target_month)
+    return date(year, month, day).isoformat()
 
 
-def merge_payload(current_payload: dict, incoming_rows: list[dict], incoming_extra: dict) -> dict:
+def merge_payload(
+    current_payload: dict,
+    incoming_rows: list[dict],
+    incoming_extra: dict,
+    source_data_at: str | None = None,
+) -> dict:
     existing_rows = list(current_payload.get("rows") or [])
     # Cópia rasa ANTES do laço de baixo — mesmo bug já documentado e corrigido
     # em src/utils/merge.js: old_meta pode ser o MESMO objeto (mesma
@@ -395,7 +428,7 @@ def merge_payload(current_payload: dict, incoming_rows: list[dict], incoming_ext
         [e.get("date") for e in unit_history],
         [row.get("dia") for row in rows],
     )
-    cutoff = _cutoff_from(latest, RETENTION_DAYS)
+    cutoff = _cutoff_from(latest, WINDOW_MONTHS)
 
     if cutoff:
         rows = [row for row in rows if not row.get("dia") or row["dia"] >= cutoff]
@@ -435,6 +468,11 @@ def merge_payload(current_payload: dict, incoming_rows: list[dict], incoming_ext
     rows[0]["unitStats"] = old_meta.get("unitStats") or []
     rows[0]["dataShift"] = old_meta.get("dataShift")
     rows[0]["catalogRows"] = old_meta.get("catalogRows") or []
+    # Carimbo do guard de frescor (ver _latest_source_timestamp / main): a
+    # maior "data" real vista nesta leitura do Postgres. Não é o horário de
+    # sincronização (uploadedAt, que é "agora") — é o dado em si. Preservamos
+    # o valor antigo se esta rodada não trouxe nada novo (source_data_at=None).
+    rows[0]["lastSourceDataAt"] = source_data_at or old_meta.get("lastSourceDataAt")
 
     return {"rows": rows, "totalRows": len(rows), "uploadedAt": datetime.now(timezone.utc).isoformat()}
 
@@ -449,6 +487,43 @@ def login(session: requests.Session, base_url: str, password: str) -> None:
     response.raise_for_status()
     if response.json().get("role") != "admin":
         raise SystemExit("Login não retornou papel admin — confira DASHBOARD_ADMIN_PASSWORD.")
+
+
+def _latest_source_timestamp(pg_rows: list[dict]) -> datetime | None:
+    """Maior "data" (timestamp real de observação, sem timezone) entre as
+    linhas lidas do Postgres nesta rodada — o sinal de frescor do guard, bem
+    diferente de "agora" (uploadedAt). Não usamos atualizado_em: ele só marca
+    quando a linha chegou no Postgres, não quando o item foi observado."""
+    values = [row.get("data") for row in pg_rows if row.get("data")]
+    return max(values) if values else None
+
+
+def _previous_source_timestamp(current_payload: dict) -> datetime | None:
+    rows = current_payload.get("rows") or []
+    raw = rows[0].get("lastSourceDataAt") if rows else None
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _guard_allows_upload(
+    previous_source_at: datetime | None,
+    incoming_source_at: datetime | None,
+    force: bool,
+) -> bool:
+    """Decide se a rodada deve seguir para o upload. Compara o TIMESTAMP
+    COMPLETO (data + hora), nunca só a data — por isso um snapshot publicado
+    às 15:15 e um novo lido às 20:15 do MESMO dia é aceito normalmente (a
+    hora diferencia Almoço de Jantar). Só bloqueia quando o novo timestamp é
+    <= o já publicado (nada de fato mais novo, no minuto/segundo)."""
+    if force:
+        return True
+    if not previous_source_at or not incoming_source_at:
+        return True
+    return incoming_source_at > previous_source_at
 
 
 def fetch_current_payload(session: requests.Session, base_url: str) -> dict:
@@ -511,6 +586,7 @@ def _apply_day_cutoff(payload: dict, cutoff: str) -> dict:
         "unitStats": meta.get("unitStats") or [],
         "dataShift": meta.get("dataShift"),
         "catalogRows": meta.get("catalogRows") or [],
+        "lastSourceDataAt": meta.get("lastSourceDataAt"),
     }
     return {"rows": rows, "totalRows": len(rows), "uploadedAt": payload.get("uploadedAt")}
 
@@ -566,6 +642,10 @@ def main() -> int:
         "--dry-run", action="store_true",
         help="Busca e mescla os dados, mas não envia nada para o dashboard — só mostra o resumo.",
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Ignora o guard de frescor e sincroniza mesmo sem dado novo no Postgres (uso manual/depuração).",
+    )
     args = parser.parse_args()
 
     pg_kwargs = _pg_connection_kwargs()
@@ -598,10 +678,35 @@ def main() -> int:
         f"{len(extra['catalogCube']['dates'])} dia(s) distintos nesta leitura."
     )
 
+    incoming_source_at = _latest_source_timestamp(pg_rows)
+
     with requests.Session() as session:
         login(session, base_url, admin_password)
         current_payload = fetch_current_payload(session, base_url)
-        merged_payload = merge_payload(current_payload, flat_rows, extra)
+
+        # Guard de frescor: não depende do relógio (não olha "que horas são
+        # agora"), e sim do próprio dado — compara a maior "data" real lida
+        # agora com a maior "data" já registrada no snapshot anterior do
+        # dashboard (rows[0].lastSourceDataAt). Se o Postgres ainda não
+        # recebeu nada mais novo que o que já está publicado, não faz sentido
+        # gastar um upload (e o risco, ainda que pequeno, de publicar uma
+        # leitura parcial) — melhor abortar e avisar no log.
+        previous_source_at = _previous_source_timestamp(current_payload)
+        print(
+            f"Snapshot a enviar: maior 'data' real = {incoming_source_at}; "
+            f"snapshot anterior já publicado = {previous_source_at}."
+        )
+        if not _guard_allows_upload(previous_source_at, incoming_source_at, args.force):
+            print(
+                "[guard de frescor] Nenhum dado mais novo que o já publicado "
+                f"({previous_source_at}) — abortando sem enviar. Use --force para ignorar."
+            )
+            return 0
+
+        merged_payload = merge_payload(
+            current_payload, flat_rows, extra,
+            source_data_at=incoming_source_at.isoformat() if incoming_source_at else None,
+        )
         merged_payload = trim_payload_to_fit(merged_payload)
 
         if args.dry_run:

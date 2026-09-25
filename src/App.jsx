@@ -13,7 +13,7 @@ import { NetworkPage } from './pages/NetworkPage.jsx';
 import { PotentialPageV2 } from './pages/PotentialPageV2.jsx';
 import { FranchiseCatalogPage } from './pages/FranchiseCatalogPage.jsx';
 import { ForneriaPage } from './pages/ForneriaPage.jsx';
-import { loadDataRemote } from './utils/remote-storage.js';
+import { getSyncTriggerStatus, loadDataRemote, triggerSyncNow } from './utils/remote-storage.js';
 import { PortalLogin } from './components/PortalLogin.jsx';
 import { BrandSelector } from './components/BrandSelector.jsx';
 import { PotentialAccessGate } from './components/PotentialAccessGate.jsx';
@@ -72,6 +72,17 @@ export function App() {
   const [tab, setTab] = useState('network');
   const [all, setAll] = useState([]);
   const [syncing, setSyncing] = useState(false);
+  // "Sincronizado às" — quando o dashboard buscou este snapshot (uploadedAt
+  // do payload), distinto de "Dados até" (a última carga REAL, ver
+  // latestFullLoad abaixo). Nunca usamos isso pra fingir que os dados em si
+  // são mais recentes do que realmente são.
+  const [dataUploadedAt, setDataUploadedAt] = useState(null);
+  // Estado do botão admin "Atualizar dados": 'idle' | 'requesting' |
+  // 'requested' | 'running' | 'updated' | 'no_new_data' | 'failed' |
+  // 'unknown' | 'cooldown'. Espelha o campo `outcome` de
+  // GET /api/data/sync-status (que consulta a API do GitHub Actions de
+  // verdade) — nunca promete um resultado que o backend não confirmou.
+  const [syncTrigger, setSyncTrigger] = useState({ status: 'idle', error: null, cooldownRemaining: 0 });
   // Ajustes de preço locais (não salvos) para itens sem preço cadastrado —
   // ver src/utils/price-drafts.js. Fica no App porque precisa refletir em
   // todas as páginas que usam detailRows/productRows, não só na de Potencial.
@@ -105,14 +116,93 @@ export function App() {
     setSyncing(true);
     setAll([]);
     loadDataRemote()
-      .then((rows) => {
-        if (rows?.length) {
-          setAll(rows);
+      .then((result) => {
+        if (result?.rows?.length) {
+          setAll(result.rows);
+          setDataUploadedAt(result.uploadedAt || null);
           setFilters({ from: null, to: null, shift: null, brandId: 'all' });
         }
       })
       .finally(() => setSyncing(false));
   }, [auth, context?.store]);
+
+  // Estados em que ainda vale a pena continuar consultando o GitHub Actions
+  // — os "terminais" (updated/no_new_data/failed/unknown) não entram aqui:
+  // eles só mudam de novo quando o admin clicar de novo.
+  const SYNC_TRACKING_STATUSES = ['requested', 'running'];
+
+  // Consulta o estado do disparo ao abrir, pra já mostrar o botão
+  // desabilitado/retomar o acompanhamento se outra aba/pessoa acabou de
+  // disparar (ou se a página foi recarregada no meio do processo).
+  useEffect(() => {
+    if (auth?.role !== 'admin') return;
+    getSyncTriggerStatus().then((status) => {
+      if (!status) return;
+      if (SYNC_TRACKING_STATUSES.includes(status.outcome)) {
+        setSyncTrigger({ status: status.outcome, error: null, cooldownRemaining: status.cooldownRemaining || 0 });
+      } else if (status.inFlight) {
+        setSyncTrigger({ status: 'requested', error: null, cooldownRemaining: status.cooldownRemaining || 0 });
+      } else if (status.cooldownRemaining) {
+        setSyncTrigger({ status: 'cooldown', error: null, cooldownRemaining: status.cooldownRemaining });
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auth?.role]);
+
+  // Enquanto o disparo estiver em 'requested'/'running', consulta
+  // GET /api/data/sync-status periodicamente — esse endpoint agora consulta
+  // a API real do GitHub Actions e devolve o outcome verdadeiro (nunca
+  // inferido só pelo uploadedAt ter mudado). Só quando outcome === 'updated'
+  // é que recarregamos os dados (GET /api/data) pra pegar as linhas novas.
+  useEffect(() => {
+    if (!SYNC_TRACKING_STATUSES.includes(syncTrigger.status)) return;
+    let cancelled = false;
+    const interval = setInterval(async () => {
+      const status = await getSyncTriggerStatus();
+      if (cancelled) return;
+      if (!status) return; // falha de rede pontual — tenta de novo no próximo tick
+      const outcome = status.outcome;
+      if (outcome === 'updated') {
+        const result = await loadDataRemote();
+        if (cancelled) return;
+        if (result?.rows?.length) {
+          setAll(result.rows);
+          setDataUploadedAt(result.uploadedAt || null);
+        }
+        setSyncTrigger({ status: 'updated', error: null, cooldownRemaining: 0 });
+      } else if (outcome === 'no_new_data' || outcome === 'failed') {
+        setSyncTrigger({ status: outcome, error: null, cooldownRemaining: 0 });
+      } else if (outcome === 'requested' || outcome === 'running') {
+        setSyncTrigger((current) => (
+          current.status === outcome ? current : { status: outcome, error: null, cooldownRemaining: 0 }
+        ));
+      }
+      // outcome null/'unknown' enquanto ainda tracking: mantém o status atual
+      // e tenta de novo no próximo tick — só desiste no timeout abaixo.
+    }, 10_000);
+    // Não fica esperando pra sempre: depois de 6min sem uma conclusão real
+    // (completed com sucesso ou falha), assume estado indeterminado — nunca
+    // "Dados atualizados" nem "Nenhum dado novo" sem confirmação do GitHub.
+    const timeout = setTimeout(() => {
+      if (!cancelled) setSyncTrigger((current) => (
+        SYNC_TRACKING_STATUSES.includes(current.status)
+          ? { status: 'unknown', error: null, cooldownRemaining: 0 }
+          : current
+      ));
+    }, 6 * 60_000);
+    return () => { cancelled = true; clearInterval(interval); clearTimeout(timeout); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [syncTrigger.status]);
+
+  async function handleTriggerSync() {
+    setSyncTrigger({ status: 'requesting', error: null, cooldownRemaining: 0 });
+    try {
+      const result = await triggerSyncNow();
+      setSyncTrigger({ status: 'requested', error: null, cooldownRemaining: result.cooldownSeconds || 0 });
+    } catch (error) {
+      setSyncTrigger({ status: 'idle', error: error.message, cooldownRemaining: 0 });
+    }
+  }
 
   useEffect(() => {
     if (!auth?.role || (auth.role === 'franchise' && !context?.store)) return;
@@ -333,10 +423,12 @@ export function App() {
   }
 
   const activeBrand = context?.brandId ? brandById(context.brandId) : null;
-  // "Atualizado até" no rodapé da sidebar tem que mostrar a última carga
-  // REAL (data+turno), não o filtro que o usuário tem selecionado na tela —
-  // senão clicar em "Almoço" faz o rótulo dizer "Atualizado até Almoço"
-  // mesmo já existindo uma carga de Jantar mais recente.
+  // "Dados até" (rodapé da sidebar) tem que mostrar a última carga REAL
+  // (data+turno), não o filtro que o usuário tem selecionado na tela — senão
+  // clicar em "Almoço" faz o indicador dizer "Dados até Almoço" mesmo já
+  // existindo uma carga de Jantar mais recente. Ver latestFullLoad acima.
+  // Distinto de "Sincronizado às" (dataUploadedAt), que é só a hora em que o
+  // dashboard buscou este snapshot — não o período real dos dados.
   const lastLoadDate = latestFullLoad?.date || lastDate;
   const lastLoadShift = latestFullLoad?.shift || defaultShift;
 
@@ -344,6 +436,7 @@ export function App() {
     <div className="app-shell has-sidebar" style={activeBrand ? { '--portal-accent': activeBrand.color, '--portal-accent-soft': activeBrand.soft } : undefined}>
       <PortalHeader tab={tab} onTabChange={setTab} all={pageRows} lastDate={lastLoadDate}
         shift={lastLoadShift} syncing={syncing} context={context} role={auth.role}
+        syncedAt={dataUploadedAt} syncTrigger={syncTrigger} onTriggerSync={handleTriggerSync}
         onChangeContext={isAdmin ? null : () => { setContext(null); setTab('dash'); }} onLogout={logout} />
 
       <div className="app-content">

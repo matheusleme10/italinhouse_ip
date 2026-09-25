@@ -24,6 +24,19 @@ export function AnalysisFilters({
   const last = dates.at(-1);
   const dirty = draft.from !== value.from || draft.to !== value.to || draft.shift !== value.shift;
   const invalid = draft.from && draft.to && draft.from > draft.to;
+  // "Ativo" = o usuário escolheu algo diferente da última carga (período
+  // != só a última data, ou turno != o turno padrão da carga). Indicador
+  // discreto — não afeta "Dados até", que é sempre sobre a última carga real.
+  const isFiltered = Boolean(
+    (value.from && value.from !== last)
+    || (value.to && value.to !== last)
+    || (value.shift && value.shift !== dataShift),
+  );
+  function clearFilters() {
+    const cleared = { from: null, to: null, shift: null };
+    setDraft(cleared);
+    onChange(cleared);
+  }
 
   function update(field, next) {
     setDraft((current) => ({ ...current, [field]: next }));
@@ -38,6 +51,7 @@ export function AnalysisFilters({
       <div className="date-filter-label">
         <Ic n="filter" s={14} c={C.muted} />
         <span>Período da análise</span>
+        {isFiltered && <span className="filter-active-dot" title="Filtro ativo" aria-label="Filtro ativo" />}
       </div>
       <div className="date-presets">
         <button type="button" onClick={() => preset(last, last)}>Última carga</button>
@@ -78,6 +92,11 @@ export function AnalysisFilters({
       >
         {invalid ? 'Período inválido' : dirty ? 'Aplicar' : 'Aplicado'}
       </button>
+      {isFiltered && (
+        <button type="button" className="date-clear" onClick={clearFilters}>
+          Limpar filtros
+        </button>
+      )}
     </section>
   );
 }

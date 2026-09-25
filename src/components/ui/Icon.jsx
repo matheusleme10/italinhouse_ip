@@ -26,12 +26,13 @@ export const ICONS = {
   filter: 'M10 18h4v-2h-4v2zM3 6v2h18V6H3zm3 7h12v-2H6v2z',
   spread: 'M20 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h15c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-9 14H7v-2h4v2zm6 0h-4v-2h4v2zm0-4H7v-2h10v2zm0-4H7V7h10v2z',
   moon: 'M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z',
+  refresh: 'M17.65 6.35A7.958 7.958 0 0 0 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08a5.99 5.99 0 0 1-5.65 4c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z',
   sun: 'M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2v-2H2v2zm18 0h2v-2h-2v2zm-8-8h2V3h-2v2zm0 18h2v-2h-2v2zM5.99 4.58L4.58 5.99 6 7.4l1.41-1.41-1.42-1.41zm12.02 14.02L19.42 20l1.41-1.41L19.42 17.2l-1.41 1.4zM18.36 5.64l1.41-1.41-1.41-1.41-1.41 1.41 1.41 1.41zM4.58 18.36L6 19.78l1.41-1.42L6 17 4.58 18.36z',
 };
 
-export function Icon({ n, s = 16, c = 'currentColor' }) {
+export function Icon({ n, s = 16, c = 'currentColor', className }) {
   return (
-    <svg width={s} height={s} viewBox="0 0 24 24" fill={c} style={{ flexShrink: 0 }}>
+    <svg width={s} height={s} viewBox="0 0 24 24" fill={c} className={className} style={{ flexShrink: 0 }}>
       <path d={ICONS[n] || ICONS.alert} />
     </svg>
   );

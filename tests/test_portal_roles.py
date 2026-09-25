@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 import asyncio
 import gzip
 import hashlib
+import httpx
 import json
 
 import backend.main as main_module
@@ -397,3 +398,166 @@ def test_admin_can_persist_notification_toggle_and_many_recipients(monkeypatch, 
         })
         assert smtp_missing.status_code == 503
         assert "SMTP_HOST" in smtp_missing.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Rastreamento do disparo manual de sync via GitHub Actions
+# (_map_run_status_to_outcome / _find_matching_run, usados por
+# GET /api/data/sync-status). Cobrem exatamente os cenários pedidos: run
+# ainda não encontrado, queued, in_progress, completed/success com
+# uploadedAt novo, completed/success com uploadedAt igual, e
+# completed/failure.
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timezone
+
+from backend.main import _find_matching_run, _map_run_status_to_outcome
+
+
+def test_map_run_status_run_ainda_nao_encontrado_e_requested():
+    assert _map_run_status_to_outcome(None, "2026-09-25T10:00:00Z", "2026-09-25T10:00:00Z") == "requested"
+
+
+def test_map_run_status_queued_e_requested():
+    run = {"status": "queued"}
+    assert _map_run_status_to_outcome(run, "2026-09-25T10:00:00Z", "2026-09-25T10:00:00Z") == "requested"
+
+
+def test_map_run_status_in_progress_e_running():
+    run = {"status": "in_progress"}
+    assert _map_run_status_to_outcome(run, "2026-09-25T10:00:00Z", "2026-09-25T10:00:00Z") == "running"
+
+
+def test_map_run_status_completed_sucesso_com_uploaded_at_novo_e_updated():
+    run = {"status": "completed", "conclusion": "success"}
+    outcome = _map_run_status_to_outcome(run, "2026-09-25T10:00:00Z", "2026-09-25T12:00:00Z")
+    assert outcome == "updated"
+
+
+def test_map_run_status_completed_sucesso_com_uploaded_at_igual_e_no_new_data():
+    run = {"status": "completed", "conclusion": "success"}
+    outcome = _map_run_status_to_outcome(run, "2026-09-25T10:00:00Z", "2026-09-25T10:00:00Z")
+    assert outcome == "no_new_data"
+
+
+def test_map_run_status_completed_falha_e_failed():
+    run = {"status": "completed", "conclusion": "failure"}
+    outcome = _map_run_status_to_outcome(run, "2026-09-25T10:00:00Z", "2026-09-25T10:00:00Z")
+    assert outcome == "failed"
+
+
+def test_map_run_status_completed_cancelado_tambem_e_failed():
+    run = {"status": "completed", "conclusion": "cancelled"}
+    assert _map_run_status_to_outcome(run, None, None) == "failed"
+
+
+def test_find_matching_run_ignora_evento_diferente_de_workflow_dispatch():
+    triggered_at = datetime(2026, 9, 25, 10, 0, 0, tzinfo=timezone.utc)
+    runs = [
+        {
+            "event": "schedule",
+            "head_branch": "main",
+            "created_at": "2026-09-25T10:05:00Z",
+            "id": 1,
+        },
+    ]
+    assert _find_matching_run(runs, triggered_at, "main") is None
+
+
+def test_find_matching_run_ignora_branch_diferente():
+    triggered_at = datetime(2026, 9, 25, 10, 0, 0, tzinfo=timezone.utc)
+    runs = [
+        {
+            "event": "workflow_dispatch",
+            "head_branch": "outra-branch",
+            "created_at": "2026-09-25T10:05:00Z",
+            "id": 1,
+        },
+    ]
+    assert _find_matching_run(runs, triggered_at, "main") is None
+
+
+def test_find_matching_run_ignora_run_criado_antes_do_disparo():
+    triggered_at = datetime(2026, 9, 25, 10, 0, 0, tzinfo=timezone.utc)
+    runs = [
+        {
+            "event": "workflow_dispatch",
+            "head_branch": "main",
+            "created_at": "2026-09-25T09:55:00Z",
+            "id": 1,
+        },
+    ]
+    assert _find_matching_run(runs, triggered_at, "main") is None
+
+
+def test_find_matching_run_escolhe_o_mais_antigo_apos_o_disparo():
+    triggered_at = datetime(2026, 9, 25, 10, 0, 0, tzinfo=timezone.utc)
+    runs = [
+        {
+            "event": "workflow_dispatch",
+            "head_branch": "main",
+            "created_at": "2026-09-25T10:10:00Z",
+            "id": 2,
+        },
+        {
+            "event": "workflow_dispatch",
+            "head_branch": "main",
+            "created_at": "2026-09-25T10:02:00Z",
+            "id": 1,
+        },
+    ]
+    match = _find_matching_run(runs, triggered_at, "main")
+    assert match is not None
+    assert match["id"] == 1
+
+
+def test_sync_status_sem_disparo_previo_retorna_outcome_none(monkeypatch):
+    LOGIN_ATTEMPTS.clear()
+    admin_password = "admin-sync-status-test"
+    monkeypatch.setenv("ADMIN_PASSWORD_HASH", hashlib.sha256(admin_password.encode()).hexdigest())
+    monkeypatch.setenv("SESSION_SECRET", "segredo-de-sessao-com-mais-de-trinta-e-dois-caracteres")
+    monkeypatch.setattr(main_module, "SYNC_TRIGGER_STATE", {
+        "lastTriggeredAt": 0.0,
+        "inFlight": False,
+        "lastTriggeredBy": None,
+        "triggeredAtIso": None,
+        "uploadedAtAtTrigger": None,
+    })
+
+    with TestClient(app) as admin:
+        admin.post("/api/session", json={"password": admin_password})
+        response = admin.get("/api/data/sync-status")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["outcome"] is None
+        # Nunca exposto ao frontend.
+        assert "GITHUB_SYNC_TOKEN" not in json.dumps(body)
+
+
+def test_sync_status_falha_de_rede_no_github_devolve_outcome_unknown(monkeypatch):
+    LOGIN_ATTEMPTS.clear()
+    admin_password = "admin-sync-status-unknown-test"
+    monkeypatch.setenv("ADMIN_PASSWORD_HASH", hashlib.sha256(admin_password.encode()).hexdigest())
+    monkeypatch.setenv("SESSION_SECRET", "segredo-de-sessao-com-mais-de-trinta-e-dois-caracteres")
+    monkeypatch.setattr(main_module, "GITHUB_SYNC_TOKEN", "token-de-teste")
+    monkeypatch.setattr(main_module, "SYNC_TRIGGER_STATE", {
+        "lastTriggeredAt": 0.0,
+        "inFlight": False,
+        "lastTriggeredBy": None,
+        "triggeredAtIso": "2026-09-25T10:00:00+00:00",
+        "uploadedAtAtTrigger": "2026-09-25T09:00:00+00:00",
+    })
+
+    async def boom(_http_client):
+        raise httpx.ConnectError("sem rede")
+
+    monkeypatch.setattr(main_module, "_fetch_recent_workflow_runs", boom)
+
+    with TestClient(app) as admin:
+        admin.post("/api/session", json={"password": admin_password})
+        response = admin.get("/api/data/sync-status")
+        assert response.status_code == 200
+        body = response.json()
+        # Nunca inventa sucesso/no_new_data quando não conseguimos consultar
+        # o GitHub — estado indeterminado explícito.
+        assert body["outcome"] == "unknown"
