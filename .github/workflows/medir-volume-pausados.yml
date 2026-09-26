@@ -1,0 +1,54 @@
+name: Medir volume do Postgres (itens pausados) — diagnóstico manual
+
+# Workflow SEPARADO do sync automático (.github/workflows/sync-postgres.yml).
+# Só existe para rodar scripts/medir_volume_postgres.py manualmente e
+# confirmar, com números reais, se trim_payload_to_fit está cortando dias
+# antigos silenciosamente (ver diagnóstico da janela de 3 meses).
+#
+# Só leitura, só manual, sem nenhum efeito colateral:
+#   - só faz SELECT no Postgres (nenhum INSERT/UPDATE/DELETE em lugar nenhum);
+#   - NÃO chama /api/data/upload nem qualquer endpoint do dashboard;
+#   - NÃO loga no dashboard (não usa DASHBOARD_PUBLIC_URL/DASHBOARD_ADMIN_PASSWORD
+#     — só precisa dos secrets DB_* já usados pelo sync automático);
+#   - NÃO roda scripts/sync_postgres_pausados.py como processo principal — só
+#     importa funções dele (build_flat_rows, _cutoff_from, trim_payload_to_fit
+#     etc.) para reusar exatamente a mesma lógica, sem duplicá-la;
+#   - trim_payload_to_fit é chamado só em memória, sobre um payload simulado
+#     nesta execução — nunca sobre o payload real do dashboard;
+#   - não dispara o workflow normal de sincronização e não altera os horários
+#     de cron dele;
+#   - o script (scripts/medir_volume_postgres.py) nunca imprime host, porta,
+#     usuário, senha, connection string ou qualquer outro secret — só métricas
+#     agregadas (MIN/MAX de data, contagens de linhas/dias, tamanhos de JSON e
+#     gzip, resultado do trim simulado).
+on:
+  workflow_dispatch: {} # só manual, pela aba Actions no GitHub — sem cron.
+
+jobs:
+  medir:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências do script
+        run: pip install -r scripts/requirements.txt
+
+      - name: Medir volume (só leitura — sem upload, sem escrita no banco)
+        env:
+          # Mesmos nomes de secrets já usados por sync-postgres.yml — não
+          # precisamos (e não usamos) DASHBOARD_PUBLIC_URL nem
+          # DASHBOARD_ADMIN_PASSWORD, porque este script nunca loga no
+          # dashboard nem faz upload.
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_SSLMODE: ${{ secrets.DB_SSLMODE }}
+        run: python scripts/medir_volume_postgres.py
