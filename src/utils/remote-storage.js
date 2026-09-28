@@ -161,3 +161,45 @@ export async function isRemoteAvailable() {
     return false;
   }
 }
+
+/**
+ * loadSummaryRemote / loadCatalogChunk — arquitetura particionada nova
+ * (ver backend/catalog_chunks.py e GET /api/data/summary|catalog-chunk/
+ * {period} em backend/main.py). O summary carrega tudo que é pequeno
+ * (networkHistory/unitHistory/dataShift/lastSourceDataAt/effectiveFrom/
+ * effectiveTo/manifest de chunks); o catalogCube (a parte grande) vem em
+ * blocos mensais separados, buscados só para os meses que o período
+ * selecionado realmente cobre.
+ *
+ * Cache por período+updatedAt: se o `updatedAt` de um chunk no manifest do
+ * summary não mudou desde a última busca, reaproveita o cubo já em memória
+ * em vez de baixar de novo — é assim que "o cache invalida quando o
+ * updatedAt correspondente no manifest muda" (e nunca antes disso).
+ */
+const catalogChunkCache = new Map(); // key: `${period}:${updatedAt}` -> catalogCube
+
+export async function loadSummaryRemote() {
+  try {
+    const res = await fetch(`${API}/summary`, { credentials: 'same-origin', cache: 'no-store' });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.hasData ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function loadCatalogChunk(period, updatedAt) {
+  const cacheKey = `${period}:${updatedAt || ''}`;
+  if (catalogChunkCache.has(cacheKey)) return catalogChunkCache.get(cacheKey);
+  try {
+    const res = await fetch(`${API}/catalog-chunk/${period}`, { credentials: 'same-origin', cache: 'no-store' });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const cube = data?.hasData ? data.catalogCube : null;
+    catalogChunkCache.set(cacheKey, cube);
+    return cube;
+  } catch {
+    return null;
+  }
+}

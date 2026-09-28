@@ -1,0 +1,64 @@
+name: Migrar para chunks mensais do catálogo (manual, idempotente)
+
+# Workflow SEPARADO do sync automático (.github/workflows/sync-postgres.yml)
+# e do diagnóstico de volume (.github/workflows/medir-volume-pausados.yml).
+# Roda scripts/migrate_catalog_chunks.py — a migração inicial (e, se
+# necessário, uma reconstrução posterior) para a arquitetura particionada
+# (summary.json.gz + catalog-chunks/{YYYY-MM}.json.gz), direto do
+# PostgreSQL. Nunca lê nem escreve current.json.gz (o payload legado, que já
+# sofreu trim_payload_to_fit e não é uma fonte confiável para reconstrução
+# histórica — continua existindo intocado, só como rollback do frontend
+# antigo).
+#
+# Idempotente: cada execução busca a janela completa (últimos 3
+# meses-calendário, ancorados no MAX(data) real do banco) direto do Postgres
+# e SOBRESCREVE os chunks mensais correspondentes — rodar de novo com o
+# banco no mesmo estado produz o mesmo resultado. Publica todos os chunks
+# primeiro; só depois de todos terem sucesso é que publica o summary/
+# manifest (publicação atômica na prática — ver docstring do script).
+#
+# Só manual (workflow_dispatch) — nunca roda em cron, nunca é disparado por
+# outro workflow. Precisa dos mesmos secrets DB_* já usados por
+# sync-postgres.yml e dos secrets DASHBOARD_PUBLIC_URL/DASHBOARD_ADMIN_PASSWORD
+# (loga como admin, publica via POST /api/data/catalog-chunk/{period}/upload
+# e POST /api/data/summary/upload — mesmo caminho HTTP que o sync novo usa,
+# sem nenhuma escrita direta no Vercel Blob a partir daqui).
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Só mostrar o que seria publicado, sem publicar nada (true/false)"
+        required: false
+        default: "false"
+
+jobs:
+  migrar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências do script
+        run: pip install -r scripts/requirements.txt
+
+      - name: Migrar chunks mensais direto do PostgreSQL
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_SSLMODE: ${{ secrets.DB_SSLMODE }}
+          DASHBOARD_PUBLIC_URL: ${{ secrets.DASHBOARD_PUBLIC_URL }}
+          DASHBOARD_ADMIN_PASSWORD: ${{ secrets.DASHBOARD_ADMIN_PASSWORD }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python scripts/migrate_catalog_chunks.py --dry-run
+          else
+            python scripts/migrate_catalog_chunks.py
+          fi

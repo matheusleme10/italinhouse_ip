@@ -94,6 +94,21 @@ function mergeCatalogCube(oldCube, newCube) {
   return { version: 1, stores, items, categories, dates, shifts, records: [...merged.values()] };
 }
 
+// Recombina vários chunks mensais (já buscados via loadCatalogChunk) numa
+// única estrutura catalogCube decodificável por decodeCatalogCube — mesma
+// lógica de mergeCatalogCube acima (chaves repetidas não deveriam existir,
+// já que cada chunk é de um mês distinto, mas em caso de sobreposição o
+// último cubo da lista vence). Espelho de combine_cubes em
+// backend/catalog_chunks.py — não mude só aqui, mude nos dois lugares.
+export function combineCatalogCubes(cubes) {
+  let result = null;
+  for (const cube of cubes || []) {
+    if (!cube) continue;
+    result = result ? mergeCatalogCube(result, cube) : cube;
+  }
+  return result || { version: 1, stores: [], items: [], categories: [], dates: [], shifts: [], records: [] };
+}
+
 function maxDate(...lists) {
   let max = '';
   for (const list of lists) {

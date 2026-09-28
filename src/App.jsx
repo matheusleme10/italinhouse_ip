@@ -13,7 +13,11 @@ import { NetworkPage } from './pages/NetworkPage.jsx';
 import { PotentialPageV2 } from './pages/PotentialPageV2.jsx';
 import { FranchiseCatalogPage } from './pages/FranchiseCatalogPage.jsx';
 import { ForneriaPage } from './pages/ForneriaPage.jsx';
-import { getSyncTriggerStatus, loadDataRemote, triggerSyncNow } from './utils/remote-storage.js';
+import {
+  getSyncTriggerStatus, loadCatalogChunk, loadDataRemote, loadSummaryRemote, triggerSyncNow,
+} from './utils/remote-storage.js';
+import { combineCatalogCubes } from './utils/merge.js';
+import { monthsBetween } from './utils/period.js';
 import { PortalLogin } from './components/PortalLogin.jsx';
 import { BrandSelector } from './components/BrandSelector.jsx';
 import { PotentialAccessGate } from './components/PotentialAccessGate.jsx';
@@ -126,6 +130,43 @@ export function App() {
       .finally(() => setSyncing(false));
   }, [auth, context?.store]);
 
+  // Arquitetura particionada (summary.json.gz + catalog-chunks/{YYYY-MM}) —
+  // ver backend/catalog_chunks.py. Carregado EM PARALELO ao "all" legado
+  // acima: enquanto o summary não existir (pré-migração) ou o backend
+  // decidir que o current.json.gz legado é mais recente (upload manual
+  // feito depois da migração — ver _active_summary_source no backend),
+  // `summary` fica null e o app cai de volta no caminho 100% legado (nada
+  // muda visualmente nesse caso).
+  const [summary, setSummary] = useState(null);
+  const [combinedCube, setCombinedCube] = useState(null);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+
+  useEffect(() => {
+    if (!auth?.role || (auth.role === 'franchise' && !auth.identified)) return;
+    let cancelled = false;
+    loadSummaryRemote().then((data) => {
+      if (cancelled) return;
+      setSummary(data);
+      if (data?.uploadedAt) setDataUploadedAt(data.uploadedAt);
+    });
+    return () => { cancelled = true; };
+  }, [auth, context?.store]);
+
+  const legacyMetadata = useMemo(() => all.find((row) => row.networkSummary || row.catalogRows) || {}, [all]);
+  const metadata = useMemo(() => (summary ? {
+    networkSummary: summary.networkSummary ?? null,
+    networkHistory: summary.networkHistory || [],
+    unitHistory: summary.unitHistory || [],
+    unitStats: summary.unitStats || [],
+    dataShift: summary.dataShift,
+    lastSourceDataAt: summary.lastSourceDataAt,
+    catalogHistory: legacyMetadata.catalogHistory || [],
+    catalogRows: legacyMetadata.catalogRows || [],
+    productHistory: legacyMetadata.productHistory || [],
+    forneriaSummaryHistory: legacyMetadata.forneriaSummaryHistory || [],
+    catalogCube: combinedCube,
+  } : legacyMetadata), [summary, combinedCube, legacyMetadata]);
+
   // Estados em que ainda vale a pena continuar consultando o GitHub Actions
   // — os "terminais" (updated/no_new_data/failed/unknown) não entram aqui:
   // eles só mudam de novo quando o admin clicar de novo.
@@ -209,7 +250,6 @@ export function App() {
     fetchPriceOverrides().then(setPriceOverrides);
   }, [auth?.role, context?.store]);
 
-  const metadata = useMemo(() => all.find((row) => row.networkSummary || row.catalogRows) || {}, [all]);
   const unitHistory = metadata.unitHistory || [];
   const catalogHistory = metadata.catalogHistory?.length
     ? metadata.catalogHistory
@@ -245,10 +285,31 @@ export function App() {
   const defaultShift = latestFullLoad?.shift
     || (['Almoço', 'Jantar', 'Ambos'].includes(metadata.dataShift) ? metadata.dataShift : null)
     || 'Jantar';
-  const effectiveFrom = filters.from || defaultDate;
+  // Período padrão = "últimos 3 meses" (effectiveFrom vindo do summary, já
+  // calculado no backend a partir de MAX(data) real — ver
+  // backend/catalog_chunks.py::cutoff_from) quando a arquitetura nova já
+  // está disponível; sem summary (pré-migração), cai de volta no
+  // comportamento antigo (só a última carga) — nada muda nesse caso.
+  const effectiveFrom = filters.from || summary?.effectiveFrom || defaultDate;
   const effectiveTo = filters.to || defaultDate;
   const effectiveShift = filters.shift || defaultShift;
   const selectedDate = effectiveTo;
+
+  // Busca só os chunks mensais (catalogCube) que o período selecionado
+  // realmente cobre — nunca o histórico inteiro. O cache em
+  // loadCatalogChunk (remote-storage.js) já evita rebaixar um chunk cujo
+  // updatedAt não mudou desde a última busca.
+  useEffect(() => {
+    if (!summary?.chunks) { setCombinedCube(null); return undefined; }
+    const periods = monthsBetween(effectiveFrom, effectiveTo).filter((period) => summary.chunks[period]);
+    if (!periods.length) { setCombinedCube(null); return undefined; }
+    let cancelled = false;
+    setCatalogLoading(true);
+    Promise.all(periods.map((period) => loadCatalogChunk(period, summary.chunks[period]?.updatedAt)))
+      .then((cubes) => { if (!cancelled) setCombinedCube(combineCatalogCubes(cubes)); })
+      .finally(() => { if (!cancelled) setCatalogLoading(false); });
+    return () => { cancelled = true; };
+  }, [summary, effectiveFrom, effectiveTo]);
   const isAdmin = auth?.role === 'admin';
   const scopeBrand = isAdmin ? filters.brandId : (context?.brandId || 'all');
   const franchiseStoreCandidates = useMemo(() => [...new Set(unitHistory
@@ -446,6 +507,7 @@ export function App() {
             value={{ from: effectiveFrom, to: effectiveTo, shift: effectiveShift }}
             onChange={(next) => setFilters((current) => ({ ...current, ...next }))}
             dataShift={metadata.dataShift}
+            loading={catalogLoading}
           />
         )}
         {all.length > 0 && isAdmin && !['notify', 'update', 'access'].includes(tab) && (

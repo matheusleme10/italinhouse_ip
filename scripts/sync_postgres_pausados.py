@@ -67,6 +67,14 @@ ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 load_dotenv(ROOT / ".env.local", override=True)
 
+# backend/catalog_chunks.py é só stdlib (sem psycopg2/fastapi) — importável
+# daqui sem arrastar dependências do backend para o runtime do GitHub
+# Actions. É a fonte única da lógica de particionar/mesclar catalogCube por
+# mês-calendário, reaproveitada pelo fluxo novo de publicação em chunks
+# (ver publish_chunked_snapshot) para nunca divergir do que o backend espera.
+sys.path.insert(0, str(ROOT))
+from backend.catalog_chunks import merge_month_cube, months_safe_to_delete, split_cube_by_month  # noqa: E402
+
 BR_TZ = ZoneInfo("America/Sao_Paulo")
 # Janela móvel de retenção do dashboard: "últimos 3 meses-calendário",
 # ancorada na maior data REAL disponível nos dados (não em CURRENT_DATE) —
@@ -621,6 +629,153 @@ def trim_payload_to_fit(payload: dict, max_bytes: int = MAX_UPLOAD_BYTES) -> dic
     return tentativa
 
 
+# ---------------------------------------------------------------------------
+# 4b) Publicação em chunks mensais (arquitetura nova) — aditivo ao fluxo
+#     legado acima (merge_payload + trim_payload_to_fit + upload_payload),
+#     que continua existindo intacto como rollback do frontend antigo. Só o
+#     mês (ou os dois meses, numa virada de mês) tocado pelas linhas desta
+#     rodada precisa ser buscado, mesclado e republicado — os demais meses
+#     já publicados ficam intocados. Retenção física (mês inteiro no Blob)
+#     é separada da janela analítica (effectiveFrom/effectiveTo, 3
+#     meses-calendário exatos) — nunca deletamos um dia de dentro de um
+#     chunk só porque ficou fora da janela; quem aplica o corte exato é o
+#     frontend, dia a dia, ao decodificar o cubo combinado.
+# ---------------------------------------------------------------------------
+
+def fetch_summary(session: requests.Session, base_url: str) -> dict:
+    response = session.get(f"{base_url}/api/data/summary", timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    return data if data.get("hasData") else {}
+
+
+def fetch_catalog_chunk(session: requests.Session, base_url: str, period: str) -> dict | None:
+    response = session.get(f"{base_url}/api/data/catalog-chunk/{period}", timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    return data.get("catalogCube") if data.get("hasData") else None
+
+
+def upload_catalog_chunk(session: requests.Session, base_url: str, period: str, cube: dict) -> dict:
+    compressed = gzip.compress(
+        json.dumps(cube, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        compresslevel=9,
+    )
+    response = session.post(
+        f"{base_url}/api/data/catalog-chunk/{period}/upload",
+        data=compressed,
+        headers={"Content-Type": "application/gzip"},
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def upload_summary(session: requests.Session, base_url: str, summary: dict) -> dict:
+    compressed = gzip.compress(
+        json.dumps(summary, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        compresslevel=9,
+    )
+    response = session.post(
+        f"{base_url}/api/data/summary/upload",
+        data=compressed,
+        headers={"Content-Type": "application/gzip"},
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def delete_catalog_chunk(session: requests.Session, base_url: str, period: str) -> dict:
+    response = session.delete(f"{base_url}/api/data/catalog-chunk/{period}", timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def cleanup_old_catalog_chunks(session: requests.Session, base_url: str, summary: dict) -> list[str]:
+    """Limpeza de retenção — chamada só DEPOIS que publish_chunked_snapshot
+    já publicou chunks+summary com sucesso. Só apaga meses estritamente
+    anteriores ao mês de effectiveFrom (ver months_safe_to_delete); cada
+    falha ao apagar é isolada e best-effort — nunca invalida a
+    sincronização, que já está correta e publicada nesse ponto.
+
+    Não republica o summary sem as entradas apagadas: o manifest pode
+    continuar listando um período já apagado até a próxima publicação — o
+    endpoint de leitura do chunk simplesmente devolve hasData=false para
+    ele, e o frontend já trata isso como "sem dado nesse mês" (ver
+    combineCatalogCubes, que ignora cubos nulos), nunca como erro."""
+    candidates = months_safe_to_delete(summary.get("chunks", {}).keys(), summary.get("effectiveFrom"))
+    deleted = []
+    for period in candidates:
+        try:
+            delete_catalog_chunk(session, base_url, period)
+        except Exception as error:  # noqa: BLE001 — best-effort, nunca propaga
+            print(f"[aviso] não foi possível apagar o chunk antigo '{period}' (não crítico): {error}")
+            continue
+        deleted.append(period)
+    return deleted
+
+
+def publish_chunked_snapshot(
+    session: requests.Session,
+    base_url: str,
+    flat_rows: list[dict],
+    extra: dict,
+    source_data_at: str | None,
+) -> dict:
+    """Publica esta rodada na arquitetura nova (chunks mensais + summary),
+    além (não em vez) do upload legado já feito por upload_payload. Publicação
+    atômica NA PRÁTICA: publica todos os chunks tocados primeiro; se qualquer
+    um falhar, uma exceção sobe e o summary NUNCA é publicado (o chamador em
+    main() decide o que fazer com a exceção — nunca derruba a sincronização
+    legada, que já terminou antes desta função ser chamada)."""
+    new_chunks = split_cube_by_month(extra.get("catalogCube"))
+    existing_summary = fetch_summary(session, base_url)
+    manifest = dict(existing_summary.get("chunks") or {})
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for period, new_cube in new_chunks.items():
+        existing_cube = fetch_catalog_chunk(session, base_url, period)
+        merged_cube = merge_month_cube(existing_cube, new_cube)
+        upload_catalog_chunk(session, base_url, period, merged_cube)  # levanta em caso de falha — para aqui, sem tocar no summary
+        manifest[period] = {"updatedAt": now_iso, "recordCount": len(merged_cube.get("records", []))}
+
+    merged_network_history = _merge_history(
+        existing_summary.get("networkHistory"), extra.get("networkHistory"),
+        lambda e: f"{e.get('date')}|{e.get('shift') or ''}",
+    )
+    merged_unit_history = _merge_history(
+        existing_summary.get("unitHistory"), extra.get("unitHistory"),
+        lambda e: f"{e.get('label')}|{e.get('date')}|{e.get('shift') or ''}",
+    )
+    latest = _max_date(
+        [e.get("date") for e in merged_network_history],
+        [e.get("date") for e in merged_unit_history],
+    )
+    cutoff = _cutoff_from(latest, WINDOW_MONTHS)
+
+    def within(value: str | None) -> bool:
+        return not cutoff or not value or value >= cutoff
+
+    final_network_history = [e for e in merged_network_history if within(e.get("date"))]
+    final_unit_history = [e for e in merged_unit_history if within(e.get("date"))]
+
+    summary = {
+        "networkSummary": existing_summary.get("networkSummary"),
+        "networkHistory": final_network_history,
+        "unitHistory": final_unit_history,
+        "unitStats": existing_summary.get("unitStats") or [],
+        "dataShift": existing_summary.get("dataShift"),
+        "lastSourceDataAt": source_data_at or existing_summary.get("lastSourceDataAt"),
+        "uploadedAt": now_iso,
+        "effectiveFrom": cutoff,
+        "effectiveTo": latest,
+        "chunks": manifest,
+    }
+    upload_summary(session, base_url, summary)
+    return summary
+
+
 def upload_payload(session: requests.Session, base_url: str, payload: dict) -> dict:
     compressed = gzip.compress(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
@@ -714,6 +869,30 @@ def main() -> int:
             return 0
 
         result = upload_payload(session, base_url, merged_payload)
+
+        # Fluxo novo (chunks mensais + summary) — aditivo, nunca substitui o
+        # upload legado acima. Uma falha aqui não derruba a sincronização:
+        # o legado (current.json.gz, rollback do frontend antigo) já está
+        # publicado nesse ponto. Reaproveita a MESMA sessão logada e os
+        # MESMOS flat_rows/extra já computados nesta rodada — sem nova
+        # consulta ao Postgres.
+        try:
+            chunk_summary = publish_chunked_snapshot(
+                session, base_url, flat_rows, extra,
+                source_data_at=incoming_source_at.isoformat() if incoming_source_at else None,
+            )
+        except Exception as error:  # noqa: BLE001 — nunca propaga: ver docstring acima
+            print(f"[aviso] publicação em chunks (arquitetura nova) falhou: {error}")
+        else:
+            print(
+                f"Publicação em chunks: {len(chunk_summary['chunks'])} bloco(s) mensais no manifest, "
+                f"janela efetiva {chunk_summary['effectiveFrom']} -> {chunk_summary['effectiveTo']}."
+            )
+            # Limpeza de retenção — só depois da publicação ter tido sucesso
+            # (acima), e nunca invalida a sincronização se falhar.
+            deleted = cleanup_old_catalog_chunks(session, base_url, chunk_summary)
+            if deleted:
+                print(f"Limpeza de retenção: {len(deleted)} bloco(s) mensais antigos apagados: {', '.join(deleted)}.")
 
     print(f"Sincronizado: {merged_payload['totalRows']} linha(s) totais no dashboard.")
     print("Resposta do servidor:", result)

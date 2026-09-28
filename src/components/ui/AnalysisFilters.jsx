@@ -10,6 +10,7 @@ export function AnalysisFilters({
   value,
   onChange,
   dataShift = 'Jantar',
+  loading = false,
 }) {
   const [draft, setDraft] = useState(value);
 
@@ -52,6 +53,7 @@ export function AnalysisFilters({
         <Ic n="filter" s={14} c={C.muted} />
         <span>Período da análise</span>
         {isFiltered && <span className="filter-active-dot" title="Filtro ativo" aria-label="Filtro ativo" />}
+        {loading && <span className="filter-loading-hint" aria-live="polite">Carregando período…</span>}
       </div>
       <div className="date-presets">
         <button type="button" onClick={() => preset(last, last)}>Última carga</button>

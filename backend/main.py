@@ -26,6 +26,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
+from . import catalog_chunks
 from .catalog import items_to_csv, normalize_categories
 from .ifood_client import IFoodAPIError, IFoodClient
 
@@ -35,6 +36,14 @@ DATA_DIR = ROOT / "data"
 STAGING_DIR = DATA_DIR / "staging"
 CURRENT_DATA = DATA_DIR / "current.json.gz"
 BLOB_PATH = "ital-dashboard/current.json.gz"
+# Arquitetura particionada (chunks mensais) — ver backend/catalog_chunks.py.
+# current.json.gz/BLOB_PATH acima continuam existindo como rollback do
+# frontend antigo; NÃO são mais a fonte de verdade depois da migração (ver
+# _active_summary_source abaixo, que decide qual dos dois é o mais recente).
+SUMMARY_DATA = DATA_DIR / "summary.json.gz"
+SUMMARY_BLOB_PATH = "ital-dashboard/summary.json.gz"
+CATALOG_CHUNKS_DIR = DATA_DIR / "catalog-chunks"
+CATALOG_CHUNK_BLOB_PREFIX = "ital-dashboard/catalog-chunks/"
 ACCESS_LOG_PATH = DATA_DIR / "access-logs.jsonl"
 ACCESS_LOG_PREFIX = "ital-dashboard/access-logs/"
 ACCESS_SETTINGS_PATH = DATA_DIR / "access-settings.json"
@@ -67,6 +76,20 @@ CURRENT_PAYLOAD_CACHE_TTL_SECONDS = 60
 _CURRENT_PAYLOAD_CACHE: dict | None = None
 _CURRENT_PAYLOAD_CACHE_AT = 0.0
 _CURRENT_PAYLOAD_LOCAL_MTIME_NS: int | None = None
+
+SUMMARY_CACHE_TTL_SECONDS = 60
+_SUMMARY_CACHE: dict | None = None
+_SUMMARY_CACHE_AT = 0.0
+_SUMMARY_LOCAL_MTIME_NS: int | None = None
+
+# Chunks mudam bem menos que o resumo (só o(s) mês(es) tocado(s) por cada
+# sincronização) — cache mais longo, por período, em memória de processo.
+CATALOG_CHUNK_CACHE_TTL_SECONDS = 300
+_CATALOG_CHUNK_CACHE: dict[str, tuple[float, dict]] = {}
+# Memoiza a derivação on-the-fly (summary+chunks a partir do current.json.gz
+# legado) por uploadedAt — dividir catalogCube por mês tem custo real e não
+# deve rodar de novo a cada request enquanto o payload legado não mudar.
+_LEGACY_CHUNKS_CACHE: tuple[str | None, dict, dict] | None = None
 
 
 class CloudStorageError(RuntimeError):
@@ -525,6 +548,59 @@ def require_session(request: Request) -> str:
         raise HTTPException(status_code=401, detail="Não autorizado.")
 
 
+def _store_key(value: object) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _scope_catalog_cube(cube: dict | None, selected_store: str) -> dict | None:
+    """Reindexa um catalogCube (dicionários stores/items/categories/dates/
+    shifts + records) para conter só os registros da loja selecionada —
+    lógica extraída de filter_payload_for_store para ser reaproveitada
+    também pelo endpoint de chunk mensal (GET /api/data/catalog-chunk/
+    {period}), que escopa um chunk por vez em vez do payload inteiro."""
+    if not isinstance(cube, dict):
+        return cube
+    target = _store_key(selected_store)
+    stores = cube.get("stores", [])
+    allowed_indexes = {index for index, store in enumerate(stores) if _store_key(store) == target}
+    selected_records = [
+        record for record in cube.get("records", [])
+        if isinstance(record, list) and len(record) >= 7 and record[0] in allowed_indexes
+    ]
+    dimensions = ["stores", "items", "categories", "dates", "shifts"]
+    used_indexes = [{record[position] for record in selected_records} for position in range(5)]
+    index_maps = [
+        {old_index: new_index for new_index, old_index in enumerate(sorted(indexes))}
+        for indexes in used_indexes
+    ]
+    return {
+        **cube,
+        **{
+            dimension: [cube.get(dimension, [])[old_index] for old_index in sorted(indexes)]
+            for dimension, indexes in zip(dimensions, used_indexes)
+        },
+        "records": [
+            [*(index_maps[position][record[position]] for position in range(5)), *record[5:]]
+            for record in selected_records
+        ],
+    }
+
+
+def _redact_cube(cube: dict | None) -> dict | None:
+    """Zera o preço dos registros pausados dentro de um catalogCube — mesma
+    regra de redact_paused_revenue, extraída para ser reaproveitada pelo
+    endpoint de chunk (franqueado sem unidade identificada ainda)."""
+    if not isinstance(cube, dict) or not isinstance(cube.get("records"), list):
+        return cube
+    safe_records = []
+    for record in cube["records"]:
+        safe_record = list(record) if isinstance(record, list) else record
+        if isinstance(safe_record, list) and len(safe_record) >= 7 and safe_record[5] == 1:
+            safe_record[6] = 0
+        safe_records.append(safe_record)
+    return {**cube, "records": safe_records}
+
+
 def redact_paused_revenue(payload: dict) -> dict:
     def redact_row(row: dict) -> dict:
         safe = dict(row)
@@ -537,26 +613,13 @@ def redact_paused_revenue(payload: dict) -> dict:
             safe["catalogHistory"] = [redact_row(entry) for entry in safe["catalogHistory"]]
         if isinstance(safe.get("productHistory"), list):
             safe["productHistory"] = [redact_row(entry) for entry in safe["productHistory"]]
-        cube = safe.get("catalogCube")
-        if isinstance(cube, dict) and isinstance(cube.get("records"), list):
-            safe_cube = dict(cube)
-            safe_records = []
-            for record in cube["records"]:
-                safe_record = list(record) if isinstance(record, list) else record
-                if isinstance(safe_record, list) and len(safe_record) >= 7 and safe_record[5] == 1:
-                    safe_record[6] = 0
-                safe_records.append(safe_record)
-            safe_cube["records"] = safe_records
-            safe["catalogCube"] = safe_cube
+        if safe.get("catalogCube") is not None:
+            safe["catalogCube"] = _redact_cube(safe["catalogCube"])
         return safe
 
     safe_payload = dict(payload)
     safe_payload["rows"] = [redact_row(row) for row in payload.get("rows", [])]
     return safe_payload
-
-
-def _store_key(value: object) -> str:
-    return " ".join(str(value or "").strip().lower().split())
 
 
 def filter_payload_for_store(payload: dict, selected_store: str) -> dict:
@@ -591,32 +654,7 @@ def filter_payload_for_store(payload: dict, selected_store: str) -> dict:
             if _store_key(entry.get("loja")) == target
         ]
     meta["forneriaSummaryHistory"] = []
-
-    cube = metadata.get("catalogCube")
-    if isinstance(cube, dict):
-        stores = cube.get("stores", [])
-        allowed_indexes = {index for index, store in enumerate(stores) if _store_key(store) == target}
-        selected_records = [
-            record for record in cube.get("records", [])
-            if isinstance(record, list) and len(record) >= 7 and record[0] in allowed_indexes
-        ]
-        dimensions = ["stores", "items", "categories", "dates", "shifts"]
-        used_indexes = [{record[position] for record in selected_records} for position in range(5)]
-        index_maps = [
-            {old_index: new_index for new_index, old_index in enumerate(sorted(indexes))}
-            for indexes in used_indexes
-        ]
-        meta["catalogCube"] = {
-            **cube,
-            **{
-                dimension: [cube.get(dimension, [])[old_index] for old_index in sorted(indexes)]
-                for dimension, indexes in zip(dimensions, used_indexes)
-            },
-            "records": [
-                [*(index_maps[position][record[position]] for position in range(5)), *record[5:]]
-                for record in selected_records
-            ],
-        }
+    meta["catalogCube"] = _scope_catalog_cube(metadata.get("catalogCube"), selected_store)
 
     metadata_fields = {
         "networkSummary", "networkHistory", "unitStats", "unitHistory", "dataShift",
@@ -716,6 +754,379 @@ async def write_current_payload(payload: dict) -> None:
     _CURRENT_PAYLOAD_CACHE = payload
     _CURRENT_PAYLOAD_CACHE_AT = time.monotonic()
     _CURRENT_PAYLOAD_LOCAL_MTIME_NS = CURRENT_DATA.stat().st_mtime_ns
+
+
+# ---------------------------------------------------------------------------
+# Arquitetura particionada: summary.json.gz (networkHistory/unitHistory/
+# dataShift/lastSourceDataAt/effectiveFrom/effectiveTo/manifest de chunks) +
+# catalog-chunks/{YYYY-MM}.json.gz (um catalogCube pequeno por mês-calendário).
+# Mesmo padrão Blob-ou-disco-local com cache TTL de read/write_current_payload
+# acima, só que com chaves/caminhos próprios. Ver backend/catalog_chunks.py
+# para a lógica pura de particionar/mesclar/combinar os chunks.
+# ---------------------------------------------------------------------------
+
+async def read_summary_payload() -> dict | None:
+    global _SUMMARY_CACHE, _SUMMARY_CACHE_AT, _SUMMARY_LOCAL_MTIME_NS
+    now = time.monotonic()
+    if BLOB_TOKEN and _SUMMARY_CACHE is not None:
+        if now - _SUMMARY_CACHE_AT < SUMMARY_CACHE_TTL_SECONDS:
+            return _SUMMARY_CACHE
+    elif not BLOB_TOKEN and not _is_vercel_runtime() and SUMMARY_DATA.is_file():
+        current_mtime_ns = SUMMARY_DATA.stat().st_mtime_ns
+        if _SUMMARY_CACHE is not None and current_mtime_ns == _SUMMARY_LOCAL_MTIME_NS:
+            return _SUMMARY_CACHE
+
+    if BLOB_TOKEN:
+        from vercel.blob import AsyncBlobClient, BlobNotFoundError
+
+        try:
+            async with AsyncBlobClient(token=BLOB_TOKEN) as blob_client:
+                result = await blob_client.get(SUMMARY_BLOB_PATH, access="private")
+                compressed = await _blob_result_bytes(result)
+                if compressed is None:
+                    return None
+        except BlobNotFoundError:
+            return None
+        except Exception as error:
+            _report_blob_error("read_summary", error)
+            raise CloudStorageError(
+                "Não foi possível ler o resumo (summary) no Vercel Blob. Confira se o Blob está conectado ao projeto e faça um redeploy."
+            ) from error
+        payload = json.loads(gzip.decompress(compressed).decode("utf-8"))
+        _SUMMARY_CACHE = payload
+        _SUMMARY_CACHE_AT = now
+        _SUMMARY_LOCAL_MTIME_NS = None
+        return payload
+
+    if _is_vercel_runtime():
+        return None
+
+    if not SUMMARY_DATA.is_file():
+        return None
+    with gzip.open(SUMMARY_DATA, "rt", encoding="utf-8") as source:
+        payload = json.load(source)
+    _SUMMARY_CACHE = payload
+    _SUMMARY_CACHE_AT = now
+    _SUMMARY_LOCAL_MTIME_NS = SUMMARY_DATA.stat().st_mtime_ns
+    return payload
+
+
+async def write_summary_payload(payload: dict) -> None:
+    global _SUMMARY_CACHE, _SUMMARY_CACHE_AT, _SUMMARY_LOCAL_MTIME_NS
+    compressed = gzip.compress(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        compresslevel=9,
+    )
+    if BLOB_TOKEN:
+        from vercel.blob import AsyncBlobClient
+
+        try:
+            async with AsyncBlobClient(token=BLOB_TOKEN) as blob_client:
+                await blob_client.put(
+                    SUMMARY_BLOB_PATH,
+                    compressed,
+                    access="private",
+                    content_type="application/gzip",
+                    overwrite=True,
+                    cache_control_max_age=60,
+                )
+        except Exception as error:
+            _report_blob_error("write_summary", error)
+            raise CloudStorageError(
+                "O Vercel Blob recusou a gravação do resumo. Reconecte o Blob ao projeto e faça um redeploy sem cache."
+            ) from error
+        _SUMMARY_CACHE = payload
+        _SUMMARY_CACHE_AT = time.monotonic()
+        _SUMMARY_LOCAL_MTIME_NS = None
+        return
+
+    if _is_vercel_runtime():
+        raise CloudStorageError(
+            "Vercel Blob não configurado neste deployment. Conecte o Blob ao projeto e faça um redeploy sem cache."
+        )
+
+    DATA_DIR.mkdir(exist_ok=True)
+    temporary = DATA_DIR / "summary.next.json.gz"
+    temporary.write_bytes(compressed)
+    temporary.replace(SUMMARY_DATA)
+    _SUMMARY_CACHE = payload
+    _SUMMARY_CACHE_AT = time.monotonic()
+    _SUMMARY_LOCAL_MTIME_NS = SUMMARY_DATA.stat().st_mtime_ns
+
+
+def _chunk_blob_path(period: str) -> str:
+    return f"{CATALOG_CHUNK_BLOB_PREFIX}{period}.json.gz"
+
+
+def _chunk_local_path(period: str) -> Path:
+    return CATALOG_CHUNKS_DIR / f"{period}.json.gz"
+
+
+async def read_catalog_chunk(period: str) -> dict | None:
+    now = time.monotonic()
+    cached = _CATALOG_CHUNK_CACHE.get(period)
+    if cached and now - cached[0] < CATALOG_CHUNK_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    if BLOB_TOKEN:
+        from vercel.blob import AsyncBlobClient, BlobNotFoundError
+
+        try:
+            async with AsyncBlobClient(token=BLOB_TOKEN) as blob_client:
+                result = await blob_client.get(_chunk_blob_path(period), access="private")
+                compressed = await _blob_result_bytes(result)
+                if compressed is None:
+                    return None
+        except BlobNotFoundError:
+            return None
+        except Exception as error:
+            _report_blob_error("read_catalog_chunk", error)
+            raise CloudStorageError(
+                f"Não foi possível ler o bloco '{period}' no Vercel Blob."
+            ) from error
+        cube = json.loads(gzip.decompress(compressed).decode("utf-8"))
+        _CATALOG_CHUNK_CACHE[period] = (now, cube)
+        return cube
+
+    if _is_vercel_runtime():
+        return None
+
+    local_path = _chunk_local_path(period)
+    if not local_path.is_file():
+        return None
+    with gzip.open(local_path, "rt", encoding="utf-8") as source:
+        cube = json.load(source)
+    _CATALOG_CHUNK_CACHE[period] = (now, cube)
+    return cube
+
+
+async def write_catalog_chunk(period: str, cube: dict) -> None:
+    compressed = gzip.compress(
+        json.dumps(cube, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        compresslevel=9,
+    )
+    if BLOB_TOKEN:
+        from vercel.blob import AsyncBlobClient
+
+        try:
+            async with AsyncBlobClient(token=BLOB_TOKEN) as blob_client:
+                await blob_client.put(
+                    _chunk_blob_path(period),
+                    compressed,
+                    access="private",
+                    content_type="application/gzip",
+                    overwrite=True,
+                    cache_control_max_age=300,
+                )
+        except Exception as error:
+            _report_blob_error("write_catalog_chunk", error)
+            raise CloudStorageError(
+                f"O Vercel Blob recusou a gravação do bloco '{period}'."
+            ) from error
+        _CATALOG_CHUNK_CACHE[period] = (time.monotonic(), cube)
+        return
+
+    if _is_vercel_runtime():
+        raise CloudStorageError(
+            "Vercel Blob não configurado neste deployment. Conecte o Blob ao projeto e faça um redeploy sem cache."
+        )
+
+    CATALOG_CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = CATALOG_CHUNKS_DIR / f"{period}.next.json.gz"
+    temporary.write_bytes(compressed)
+    temporary.replace(_chunk_local_path(period))
+    _CATALOG_CHUNK_CACHE[period] = (time.monotonic(), cube)
+
+
+async def delete_catalog_chunk(period: str) -> None:
+    """Apaga um chunk mensal publicado — só chamado pela limpeza automática
+    (ver cleanup_old_catalog_chunks) depois que os chunks novos e o summary
+    novo já foram publicados com sucesso, nunca antes. Idempotente: apagar
+    um chunk que já não existe não é erro."""
+    _CATALOG_CHUNK_CACHE.pop(period, None)
+    if BLOB_TOKEN:
+        from vercel.blob import AsyncBlobClient
+
+        try:
+            async with AsyncBlobClient(token=BLOB_TOKEN) as blob_client:
+                await blob_client.delete(_chunk_blob_path(period))
+        except Exception as error:
+            _report_blob_error("delete_catalog_chunk", error)
+            raise CloudStorageError(f"O Vercel Blob recusou apagar o bloco '{period}'.") from error
+        return
+
+    if _is_vercel_runtime():
+        raise CloudStorageError(
+            "Vercel Blob não configurado neste deployment. Conecte o Blob ao projeto e faça um redeploy sem cache."
+        )
+    local_path = _chunk_local_path(period)
+    if local_path.is_file():
+        local_path.unlink()
+
+
+async def cleanup_old_catalog_chunks(effective_from: str | None, manifest: dict) -> list[str]:
+    """Limpeza automática de retenção — chamada só DEPOIS que a publicação de
+    chunks+summary já teve sucesso (nunca antes, e nunca condiciona o
+    sucesso da publicação). Usa catalog_chunks.months_safe_to_delete, que só
+    libera meses estritamente anteriores ao mês de effectiveFrom (o mês
+    parcial que contém effectiveFrom é sempre preservado). Cada falha ao
+    apagar um chunk antigo é isolada e best-effort — nunca propaga: a
+    sincronização/upload/migração recém-publicada já está correta e válida
+    independentemente da limpeza ter funcionado ou não."""
+    candidates = catalog_chunks.months_safe_to_delete(manifest.keys(), effective_from)
+    deleted: list[str] = []
+    for period in candidates:
+        try:
+            await delete_catalog_chunk(period)
+        except Exception as error:  # noqa: BLE001 — best-effort, nunca invalida a publicação
+            _report_blob_error("cleanup_old_catalog_chunks", error)
+            continue
+        deleted.append(period)
+        manifest.pop(period, None)
+    return deleted
+
+
+async def _publish_chunks_from_payload(payload: dict) -> dict | None:
+    """Depois de um upload manual bem-sucedido no caminho legado
+    (POST /api/data/upload), particiona o catalogCube recém-salvo por mês e
+    publica na arquitetura nova (chunks + summary), com a MESMA ordem seguro
+    do fluxo automático: todos os chunks tocados publicados com sucesso ->
+    summary por último -> limpeza de retenção best-effort. Chamada só depois
+    do upload legado já ter tido sucesso, e uma falha aqui nunca desfaz nem
+    invalida esse upload (ver upload_compressed_data, que envolve esta
+    chamada em try/except).
+
+    Mescla (nunca sobrescreve) cada chunk tocado com o que já está publicado
+    — não com o payload legado recém-salvo, que pode estar mais "raso" que
+    os chunks (current.json.gz sofre trim_payload_to_fit; os chunks não).
+    Sobrescrever o chunk com uma fatia derivada do legado reintroduziria
+    exatamente o tipo de perda silenciosa de dias antigos que esta
+    arquitetura existe para evitar."""
+    rows = payload.get("rows") or []
+    metadata = next(
+        (row for row in rows if row.get("networkSummary") or row.get("catalogRows") or row.get("catalogCube")),
+        {},
+    )
+    new_chunks = catalog_chunks.split_cube_by_month(metadata.get("catalogCube"))
+    existing_summary = await read_summary_payload() or {}
+    manifest = dict(existing_summary.get("chunks") or {})
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for period, new_cube in new_chunks.items():
+        existing_cube = await read_catalog_chunk(period)
+        merged_cube = catalog_chunks.merge_month_cube(existing_cube, new_cube)
+        await write_catalog_chunk(period, merged_cube)  # propaga CloudStorageError -> aborta antes do summary
+        manifest[period] = {"updatedAt": now_iso, "recordCount": len(merged_cube.get("records", []))}
+
+    network_history = metadata.get("networkHistory") or []
+    unit_history = metadata.get("unitHistory") or []
+    latest = None
+    for entry in (*network_history, *unit_history):
+        value = entry.get("date")
+        if value and (latest is None or value > latest):
+            latest = value
+    effective_to = latest
+    effective_from = catalog_chunks.cutoff_from(latest, catalog_chunks.WINDOW_MONTHS) if latest else None
+
+    summary = {
+        "networkSummary": metadata.get("networkSummary"),
+        "networkHistory": network_history,
+        "unitHistory": unit_history,
+        "unitStats": metadata.get("unitStats") or [],
+        "dataShift": metadata.get("dataShift"),
+        "lastSourceDataAt": metadata.get("lastSourceDataAt"),
+        "uploadedAt": payload.get("uploadedAt") or now_iso,
+        "effectiveFrom": effective_from,
+        "effectiveTo": effective_to,
+        "chunks": manifest,
+    }
+    await write_summary_payload(summary)
+    deleted = await cleanup_old_catalog_chunks(effective_from, manifest)
+    return {
+        "chunksPublished": sorted(new_chunks),
+        "effectiveFrom": effective_from,
+        "effectiveTo": effective_to,
+        "deletedOldChunks": deleted,
+    }
+
+
+def _legacy_chunks_and_summary(payload: dict) -> tuple[dict, dict]:
+    """Deriva, na hora (sem persistir nada), um summary + chunks mensais a
+    partir do payload monolítico antigo (current.json.gz) — usado só como
+    compatibilidade: antes da primeira migração (summary.json.gz ainda não
+    existe), ou quando um upload manual mais recente tornou o current.json.gz
+    mais novo que o summary publicado mas a publicação em chunks desse
+    upload falhou (ver _publish_chunks_from_payload, chamada best-effort a
+    partir de upload_compressed_data; ver _active_summary_source para como
+    essa comparação é feita). Memoizado por uploadedAt: dividir um
+    catalogCube grande por mês tem custo real e não deve rodar a cada
+    request enquanto o payload legado não mudar."""
+    global _LEGACY_CHUNKS_CACHE
+    uploaded_at = payload.get("uploadedAt")
+    if _LEGACY_CHUNKS_CACHE is not None and _LEGACY_CHUNKS_CACHE[0] == uploaded_at:
+        return _LEGACY_CHUNKS_CACHE[1], _LEGACY_CHUNKS_CACHE[2]
+
+    rows = payload.get("rows") or []
+    metadata = next(
+        (row for row in rows if row.get("networkSummary") or row.get("catalogRows") or row.get("catalogCube")),
+        {},
+    )
+    network_history = metadata.get("networkHistory") or []
+    unit_history = metadata.get("unitHistory") or []
+    latest = None
+    for entry in (*network_history, *unit_history):
+        value = entry.get("date")
+        if value and (latest is None or value > latest):
+            latest = value
+    effective_to = latest
+    effective_from = catalog_chunks.cutoff_from(latest, catalog_chunks.WINDOW_MONTHS) if latest else None
+
+    chunks = catalog_chunks.split_cube_by_month(metadata.get("catalogCube"))
+    manifest = {
+        period: {"updatedAt": uploaded_at, "recordCount": len(cube.get("records", []))}
+        for period, cube in chunks.items()
+    }
+
+    summary = {
+        "networkSummary": metadata.get("networkSummary"),
+        "networkHistory": network_history,
+        "unitHistory": unit_history,
+        "unitStats": metadata.get("unitStats") or [],
+        "dataShift": metadata.get("dataShift"),
+        "lastSourceDataAt": metadata.get("lastSourceDataAt"),
+        "uploadedAt": uploaded_at,
+        "effectiveFrom": effective_from,
+        "effectiveTo": effective_to,
+        "chunks": manifest,
+        "source": "legacy-on-the-fly",
+    }
+    _LEGACY_CHUNKS_CACHE = (uploaded_at, summary, chunks)
+    return summary, chunks
+
+
+async def _active_summary_source() -> tuple[dict, dict | None]:
+    """Decide qual das duas fontes vale agora: o summary/chunks publicados
+    pelo fluxo novo, ou o current.json.gz legado — e por quê: um upload
+    manual (POST /api/data/upload, usado por AdminPage.jsx) continua
+    gravando só em current.json.gz nesta fase; se ele for MAIS NOVO que o
+    summary já publicado, servir o summary antigo esconderia o upload manual
+    do usuário. Comparamos uploadedAt dos dois lados (não hasData, que os
+    dois quase sempre têm) para decidir. Retorna (summary, chunks_legados) —
+    chunks_legados é None quando o summary publicado é a fonte ativa (nesse
+    caso o chamador deve usar read_catalog_chunk(period), os blocos
+    publicados de verdade); é um dict quando a fonte ativa é o legado
+    derivado on-the-fly (o chamador já tem os chunks prontos ali)."""
+    summary = await read_summary_payload()
+    legacy = await read_current_payload()
+    if legacy is not None:
+        legacy_uploaded_at = legacy.get("uploadedAt") or ""
+        summary_uploaded_at = (summary or {}).get("uploadedAt") or ""
+        if not summary or legacy_uploaded_at > summary_uploaded_at:
+            legacy_summary, legacy_chunks = _legacy_chunks_and_summary(legacy)
+            return legacy_summary, legacy_chunks
+    if summary is not None:
+        return summary, None
+    return {}, {}
 
 
 def _default_notification_settings() -> dict:
@@ -1310,6 +1721,133 @@ async def load_saved_data(request: Request) -> dict:
     return filter_payload_for_store(response, context["store"])
 
 
+@app.get("/api/data/summary")
+async def load_summary(request: Request) -> dict:
+    """Metadados leves (networkHistory/unitHistory/dataShift/lastSourceDataAt
+    /effectiveFrom/effectiveTo/manifest de chunks) — sem o catalogCube, que
+    vem em blocos separados via GET /api/data/catalog-chunk/{period}. Ver
+    _active_summary_source para a escolha entre o novo summary publicado e
+    o current.json.gz legado."""
+    role = require_session(request)
+    summary, _ = await _active_summary_source()
+    if not summary:
+        return {"hasData": False}
+    response = {"hasData": True, **summary}
+    if role != "franchise":
+        return response
+    scoped = dict(response)
+    scoped["networkHistory"] = []
+    scoped["networkSummary"] = None
+    context = _get_franchise_context(request)
+    if context is None:
+        return scoped
+    target = _store_key(context["store"])
+    scoped["unitHistory"] = [
+        {
+            **entry,
+            "pausedRevenue": (entry.get("pausedRevenue", 0) if _store_key(entry.get("label")) == target else 0),
+        }
+        for entry in response.get("unitHistory", [])
+    ]
+    scoped["unitStats"] = [
+        entry for entry in response.get("unitStats", [])
+        if _store_key(entry.get("label") or entry.get("loja")) == target
+    ]
+    return scoped
+
+
+@app.get("/api/data/catalog-chunk/{period}")
+async def load_catalog_chunk(period: str, request: Request) -> dict:
+    """Um catalogCube pequeno (um mês-calendário) por vez — o frontend busca
+    só os meses que cobrem o período selecionado e combina (ver
+    combineCatalogCubes em src/utils/merge.js) antes de decodificar."""
+    role = require_session(request)
+    if not re.fullmatch(r"\d{4}-\d{2}", period):
+        raise HTTPException(status_code=400, detail="Período inválido (use YYYY-MM).")
+    _, legacy_chunks = await _active_summary_source()
+    cube = legacy_chunks.get(period) if legacy_chunks is not None else await read_catalog_chunk(period)
+    if cube is None:
+        return {"hasData": False, "period": period, "catalogCube": None}
+    if role == "franchise":
+        context = _get_franchise_context(request)
+        if context is None:
+            cube = _redact_cube(cube)
+        else:
+            cube = _scope_catalog_cube(cube, context["store"])
+    return {"hasData": True, "period": period, "catalogCube": cube}
+
+
+@app.post("/api/data/catalog-chunk/{period}/upload")
+async def upload_catalog_chunk(period: str, request: Request) -> dict:
+    """Publica (sobrescreve) o catalogCube de UM mês-calendário — usado pelo
+    fluxo novo de sincronização/migração (scripts/sync_postgres_pausados.py,
+    scripts/migrate_catalog_chunks.py), nunca pelo navegador diretamente.
+    Quem chama decide se mescla com o chunk existente antes de enviar (ver
+    catalog_chunks.merge_month_cube) — este endpoint só grava o que recebeu."""
+    if require_session(request) != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores podem atualizar os blocos do catálogo.")
+    if not re.fullmatch(r"\d{4}-\d{2}", period):
+        raise HTTPException(status_code=400, detail="Período inválido (use YYYY-MM).")
+    compressed = await request.body()
+    if not compressed or len(compressed) > 4_000_000:
+        raise HTTPException(status_code=413, detail="Bloco comprimido excede o limite seguro de 4 MB.")
+    try:
+        cube = json.loads(gzip.decompress(compressed).decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=400, detail="Bloco comprimido inválido.") from error
+    if not isinstance(cube, dict) or "records" not in cube:
+        raise HTTPException(status_code=400, detail="Formato de catalogCube inválido (falta 'records').")
+    try:
+        await write_catalog_chunk(period, cube)
+    except CloudStorageError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return {"success": True, "period": period, "records": len(cube.get("records", []))}
+
+
+@app.delete("/api/data/catalog-chunk/{period}")
+async def remove_catalog_chunk(period: str, request: Request) -> dict:
+    """Apaga um chunk mensal publicado — usado só pela limpeza de retenção
+    automática (scripts/sync_postgres_pausados.py, scripts/migrate_catalog_
+    chunks.py, e o upload manual em upload_compressed_data), sempre DEPOIS
+    de uma publicação de chunks+summary já ter tido sucesso. Nunca chamado
+    pelo navegador diretamente."""
+    if require_session(request) != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores podem apagar blocos do catálogo.")
+    if not re.fullmatch(r"\d{4}-\d{2}", period):
+        raise HTTPException(status_code=400, detail="Período inválido (use YYYY-MM).")
+    try:
+        await delete_catalog_chunk(period)
+    except CloudStorageError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return {"success": True, "period": period}
+
+
+@app.post("/api/data/summary/upload")
+async def upload_summary(request: Request) -> dict:
+    """Publica o summary (manifest de chunks + networkHistory/unitHistory/
+    dataShift/lastSourceDataAt/effectiveFrom/effectiveTo) — sempre o ÚLTIMO
+    passo de uma publicação: quem chama já deve ter publicado com sucesso
+    todos os chunks tocados antes de chamar este endpoint (publicação
+    atômica na prática — ver scripts/sync_postgres_pausados.py e
+    scripts/migrate_catalog_chunks.py)."""
+    if require_session(request) != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores podem atualizar o resumo.")
+    compressed = await request.body()
+    if not compressed or len(compressed) > 4_000_000:
+        raise HTTPException(status_code=413, detail="Resumo comprimido excede o limite seguro de 4 MB.")
+    try:
+        summary = json.loads(gzip.decompress(compressed).decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=400, detail="Resumo comprimido inválido.") from error
+    if not isinstance(summary, dict) or not isinstance(summary.get("chunks"), dict):
+        raise HTTPException(status_code=400, detail="Formato de resumo inválido (chunks ausente).")
+    try:
+        await write_summary_payload(summary)
+    except CloudStorageError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return {"success": True}
+
+
 @app.post("/api/data/upload")
 async def upload_compressed_data(request: Request) -> dict:
     if require_session(request) != "admin":
@@ -1329,7 +1867,24 @@ async def upload_compressed_data(request: Request) -> dict:
     except CloudStorageError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     notification = await maybe_send_notifications(payload)
-    return {"success": True, "totalRows": len(rows), "notification": notification}
+
+    # Depois do upload legado já ter tido sucesso (acima), tenta também
+    # atualizar a arquitetura nova (chunks + summary) com o mesmo payload —
+    # aditivo e best-effort: uma falha aqui nunca desfaz nem reporta erro no
+    # upload que o admin acabou de fazer (que já está salvo e visível). Ver
+    # _publish_chunks_from_payload para a ordem de segurança (chunks -> só
+    # depois summary -> só depois limpeza de retenção).
+    chunk_publish: dict | None = None
+    try:
+        chunk_publish = await _publish_chunks_from_payload(payload)
+    except Exception as error:  # noqa: BLE001 — nunca invalida o upload legado já concluído
+        _report_blob_error("publish_chunks_from_manual_upload", error)
+        chunk_publish = {"success": False, "error": str(error)}
+
+    return {
+        "success": True, "totalRows": len(rows), "notification": notification,
+        "chunkPublish": chunk_publish,
+    }
 
 
 def _find_matching_run(runs: list[dict], triggered_at: datetime, ref: str) -> dict | None:
