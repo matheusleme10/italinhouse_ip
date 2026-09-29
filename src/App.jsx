@@ -17,7 +17,7 @@ import {
   getSyncTriggerStatus, loadCatalogChunk, loadDataRemote, loadSummaryRemote, triggerSyncNow,
 } from './utils/remote-storage.js';
 import { combineCatalogCubes } from './utils/merge.js';
-import { monthsBetween } from './utils/period.js';
+import { monthsBetween, resolvePeriodRange } from './utils/period.js';
 import { PortalLogin } from './components/PortalLogin.jsx';
 import { BrandSelector } from './components/BrandSelector.jsx';
 import { PotentialAccessGate } from './components/PotentialAccessGate.jsx';
@@ -98,9 +98,16 @@ export function App() {
     setPriceOverrides((current) => ({ ...current, [overrideKey(info.store, info.item)]: result.override }));
     return result.override;
   };
+  // preset: 'last' (padrão — sempre a última carga REAL) | '7' | '14' |
+  // 'custom' (usa customFrom/customTo, escolhidos no calendário do
+  // "Personalizado" em AnalysisFilters.jsx). Nunca guardamos from/to brutos
+  // aqui — eles são sempre recalculados a partir de sortedDates via
+  // resolvePeriodRange (src/utils/period.js), o que garante que um reload
+  // sempre reabra em "Última carga" usando a maior data real disponível.
   const [filters, setFilters] = useState({
-    from: null,
-    to: null,
+    preset: 'last',
+    customFrom: null,
+    customTo: null,
     shift: null,
     brandId: 'all',
   });
@@ -285,13 +292,20 @@ export function App() {
   const defaultShift = latestFullLoad?.shift
     || (['Almoço', 'Jantar', 'Ambos'].includes(metadata.dataShift) ? metadata.dataShift : null)
     || 'Jantar';
-  // Período padrão = "últimos 3 meses" (effectiveFrom vindo do summary, já
-  // calculado no backend a partir de MAX(data) real — ver
-  // backend/catalog_chunks.py::cutoff_from) quando a arquitetura nova já
-  // está disponível; sem summary (pré-migração), cai de volta no
-  // comportamento antigo (só a última carga) — nada muda nesse caso.
-  const effectiveFrom = filters.from || summary?.effectiveFrom || defaultDate;
-  const effectiveTo = filters.to || defaultDate;
+  // Período da análise: sempre derivado de sortedDates (datas REAIS de
+  // carga) via resolvePeriodRange (src/utils/period.js) — nunca de
+  // "últimos 3 meses" nem de "hoje". Preset padrão é 'last', então um
+  // reload sempre reabre com De = Até = última carga real disponível. A
+  // janela de retenção de 3 meses (summary.effectiveFrom/effectiveTo,
+  // calculada no backend — ver backend/catalog_chunks.py::cutoff_from)
+  // continua existindo só para limitar quais chunks existem/são
+  // publicados; ela não é mais o período *default* exibido na tela.
+  const periodRange = useMemo(
+    () => resolvePeriodRange(filters.preset, sortedDates, { from: filters.customFrom, to: filters.customTo }),
+    [filters.preset, filters.customFrom, filters.customTo, sortedDates],
+  );
+  const effectiveFrom = periodRange.from || defaultDate;
+  const effectiveTo = periodRange.to || defaultDate;
   const effectiveShift = filters.shift || defaultShift;
   const selectedDate = effectiveTo;
 
@@ -504,7 +518,12 @@ export function App() {
         {all.length > 0 && !['notify', 'update', 'access'].includes(tab) && (
           <AnalysisFilters
             dates={sortedDates}
-            value={{ from: effectiveFrom, to: effectiveTo, shift: effectiveShift }}
+            value={{
+              preset: filters.preset,
+              customFrom: filters.customFrom,
+              customTo: filters.customTo,
+              shift: filters.shift,
+            }}
             onChange={(next) => setFilters((current) => ({ ...current, ...next }))}
             dataShift={metadata.dataShift}
             loading={catalogLoading}

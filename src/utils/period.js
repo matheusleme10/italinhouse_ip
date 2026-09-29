@@ -24,3 +24,38 @@ export function monthsBetween(from, to) {
   }
   return months;
 }
+
+// Presets do "Período da análise" (AnalysisFilters). `dates` é sempre a
+// lista de datas REAIS de carga, já ordenada (ex.: App.jsx::sortedDates) —
+// nunca dias corridos. Por isso "7 cargas"/"14 cargas" simplesmente pegam as
+// últimas N entradas desse array: um fim de semana ou feriado sem carga não
+// entra no array e portanto nunca é contado.
+export const PERIOD_PRESETS = ['last', '7', '14', 'custom'];
+
+// ['2026-09-20', ..., '2026-09-28'] com count=7 -> as 7 últimas datas reais
+// (ou todas, se houver menos de 7). count<=0 -> [].
+export function lastLoadDates(dates, count) {
+  if (!Array.isArray(dates) || dates.length === 0 || count <= 0) return [];
+  const n = Math.min(count, dates.length);
+  return dates.slice(dates.length - n);
+}
+
+// Resolve {from, to} para um preset + a lista de datas reais disponíveis.
+// - 'last' -> última carga (from == to == última data real).
+// - '7'/'14' -> últimas 7/14 cargas reais (from = a mais antiga da janela).
+// - 'custom' -> usa custom.from/custom.to, mas só se ambos forem datas REAIS
+//   presentes em `dates` (senão cai para o comportamento de 'last' naquele
+//   extremo) — isso é o que garante "personalizado respeita datas
+//   disponíveis" mesmo se um estado antigo/inválido chegar aqui.
+export function resolvePeriodRange(preset, dates, custom = {}) {
+  if (!Array.isArray(dates) || dates.length === 0) return { from: null, to: null };
+  const last = dates.at(-1);
+  if (preset === 'custom') {
+    const from = custom.from && dates.includes(custom.from) ? custom.from : dates[0];
+    const to = custom.to && dates.includes(custom.to) ? custom.to : last;
+    return from <= to ? { from, to } : { from: to, to: from };
+  }
+  const count = preset === '7' ? 7 : preset === '14' ? 14 : 1;
+  const window = lastLoadDates(dates, count);
+  return { from: window[0] ?? last, to: last };
+}

@@ -1,10 +1,17 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { C } from '../../constants.js';
 import { formatDateBR } from '../../utils/format.js';
+import { resolvePeriodRange } from '../../utils/period.js';
 import { Ic } from './Icon.jsx';
+import { PeriodCalendar } from './PeriodCalendar.jsx';
 
 const SHIFTS = ['Almoço', 'Jantar', 'Ambos'];
 
+// `value` = { preset: 'last'|'7'|'14'|'custom', customFrom, customTo, shift }.
+// `dates` é sempre a lista de datas REAIS de carga (união de
+// networkHistory/unitHistory/etc., já ordenada — ver App.jsx::sortedDates),
+// nunca dias corridos: por isso os presets de N cargas e o calendário de
+// "Personalizado" automaticamente pulam fins de semana/feriados sem carga.
 export function AnalysisFilters({
   dates,
   value,
@@ -12,39 +19,51 @@ export function AnalysisFilters({
   dataShift = 'Jantar',
   loading = false,
 }) {
-  const [draft, setDraft] = useState(value);
+  const [calendarOpen, setCalendarOpen] = useState(false);
+  const [draftCustom, setDraftCustom] = useState({ from: value.customFrom || null, to: value.customTo || null });
 
-  useEffect(() => setDraft(value), [
-    value.from,
-    value.to,
-    value.shift,
-  ]);
+  // Enquanto o popover está fechado, o rascunho do calendário segue o
+  // período atualmente aplicado — isso é o que garante "ao abrir o
+  // personalizado, preservar o período atualmente selecionado quando
+  // possível".
+  const preset = value.preset || 'last';
+  const shift = value.shift || dataShift;
+  const range = useMemo(
+    () => resolvePeriodRange(preset, dates, { from: value.customFrom, to: value.customTo }),
+    [preset, dates, value.customFrom, value.customTo],
+  );
+
+  useEffect(() => {
+    if (!calendarOpen) setDraftCustom({ from: range.from, to: range.to });
+  }, [calendarOpen, range.from, range.to]);
 
   if (!dates?.length) return null;
-  const first = dates[0];
-  const last = dates.at(-1);
-  const dirty = draft.from !== value.from || draft.to !== value.to || draft.shift !== value.shift;
-  const invalid = draft.from && draft.to && draft.from > draft.to;
-  // "Ativo" = o usuário escolheu algo diferente da última carga (período
-  // != só a última data, ou turno != o turno padrão da carga). Indicador
-  // discreto — não afeta "Dados até", que é sempre sobre a última carga real.
-  const isFiltered = Boolean(
-    (value.from && value.from !== last)
-    || (value.to && value.to !== last)
-    || (value.shift && value.shift !== dataShift),
-  );
+
+  const isFiltered = Boolean(preset !== 'last' || (value.shift && value.shift !== dataShift));
+
+  function applyPreset(nextPreset) {
+    setCalendarOpen(false);
+    onChange({ preset: nextPreset, customFrom: null, customTo: null, shift: value.shift });
+  }
+
+  function applyShift(nextShift) {
+    onChange({ ...value, shift: nextShift });
+  }
+
   function clearFilters() {
-    const cleared = { from: null, to: null, shift: null };
-    setDraft(cleared);
-    onChange(cleared);
+    setCalendarOpen(false);
+    onChange({ preset: 'last', customFrom: null, customTo: null, shift: null });
   }
 
-  function update(field, next) {
-    setDraft((current) => ({ ...current, [field]: next }));
+  function openCustom() {
+    setDraftCustom({ from: range.from, to: range.to });
+    setCalendarOpen((open) => !open);
   }
 
-  function preset(from, to) {
-    setDraft((current) => ({ ...current, from, to }));
+  function applyCustom() {
+    if (!draftCustom.from || !draftCustom.to) return;
+    setCalendarOpen(false);
+    onChange({ preset: 'custom', customFrom: draftCustom.from, customTo: draftCustom.to, shift: value.shift });
   }
 
   return (
@@ -56,44 +75,58 @@ export function AnalysisFilters({
         {loading && <span className="filter-loading-hint" aria-live="polite">Carregando período…</span>}
       </div>
       <div className="date-presets">
-        <button type="button" onClick={() => preset(last, last)}>Última carga</button>
-        {dates.length > 1 && (
-          <button type="button" onClick={() => preset(dates[Math.max(0, dates.length - 7)], last)}>
-            Últimas 7 cargas
+        <button type="button" className={preset === 'last' ? 'active' : ''} onClick={() => applyPreset('last')}>
+          Última carga
+        </button>
+        <button
+          type="button"
+          className={preset === '7' ? 'active' : ''}
+          onClick={() => applyPreset('7')}
+          disabled={dates.length < 2}
+        >
+          7 cargas
+        </button>
+        <button
+          type="button"
+          className={preset === '14' ? 'active' : ''}
+          onClick={() => applyPreset('14')}
+          disabled={dates.length < 2}
+        >
+          14 cargas
+        </button>
+        <div className="date-custom-wrap">
+          <button type="button" className={preset === 'custom' ? 'active' : ''} onClick={openCustom}>
+            Personalizado 📅
           </button>
-        )}
-        <button type="button" onClick={() => preset(first, last)}>13 cargas</button>
+          {calendarOpen && (
+            <PeriodCalendar
+              dates={dates}
+              from={draftCustom.from}
+              to={draftCustom.to}
+              onSelect={setDraftCustom}
+              onApply={applyCustom}
+              onCancel={() => setCalendarOpen(false)}
+            />
+          )}
+        </div>
       </div>
-      <label>De
-        <select value={draft.from || last} onChange={(event) => update('from', event.target.value)}>
-          {dates.map((date) => <option key={date} value={date}>{formatDateBR(date)}</option>)}
-        </select>
-      </label>
-      <label>Até
-        <select value={draft.to || last} onChange={(event) => update('to', event.target.value)}>
-          {dates.map((date) => <option key={date} value={date}>{formatDateBR(date)}</option>)}
-        </select>
-      </label>
+      {preset === 'custom' && range.from && (
+        <div className="date-custom-summary">
+          {formatDateBR(range.from)} até {formatDateBR(range.to)}
+        </div>
+      )}
       <div className="shift-toggle" role="group" aria-label="Turno">
-        {SHIFTS.map((shift) => (
+        {SHIFTS.map((s) => (
           <button
-            key={shift}
+            key={s}
             type="button"
-            className={(draft.shift || dataShift) === shift ? 'active' : ''}
-            onClick={() => update('shift', shift)}
+            className={shift === s ? 'active' : ''}
+            onClick={() => applyShift(s)}
           >
-            {shift}
+            {s}
           </button>
         ))}
       </div>
-      <button
-        type="button"
-        className="date-apply"
-        disabled={!dirty || invalid}
-        onClick={() => !invalid && onChange(draft)}
-      >
-        {invalid ? 'Período inválido' : dirty ? 'Aplicar' : 'Aplicado'}
-      </button>
       {isFiltered && (
         <button type="button" className="date-clear" onClick={clearFilters}>
           Limpar filtros
