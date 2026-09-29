@@ -1104,25 +1104,106 @@ def _legacy_chunks_and_summary(payload: dict) -> tuple[dict, dict]:
     return summary, chunks
 
 
+def _legacy_metadata_row(payload: dict) -> dict:
+    """Mesma linha 'meta' que _legacy_chunks_and_summary já usa (a que carrega
+    networkSummary/catalogRows/catalogCube/networkHistory) — extraída aqui
+    pra _active_summary_source poder ler lastSourceDataAt sem duplicar o
+    critério de seleção da linha."""
+    rows = payload.get("rows") or []
+    return next(
+        (row for row in rows if row.get("networkSummary") or row.get("catalogRows") or row.get("catalogCube")),
+        {},
+    )
+
+
+def _merge_history_entries(base: list | None, extra: list | None, key_of) -> list:
+    """União por chave — mesmo formato de
+    scripts/sync_postgres_pausados.py::_merge_history, replicado aqui (sem
+    importar o script, que carrega psycopg2/requests só usados no ambiente
+    de sync) para o fallback de _active_summary_source nunca DESCARTAR um
+    mês que uma das duas fontes já tinha, mesmo quando a outra "vence" a
+    escolha de qual fonte fica ativa."""
+    merged: dict[str, dict] = {}
+    for entry in base or []:
+        merged[key_of(entry)] = entry
+    for entry in extra or []:
+        merged[key_of(entry)] = entry
+    return list(merged.values())
+
+
 async def _active_summary_source() -> tuple[dict, dict | None]:
     """Decide qual das duas fontes vale agora: o summary/chunks publicados
     pelo fluxo novo, ou o current.json.gz legado — e por quê: um upload
     manual (POST /api/data/upload, usado por AdminPage.jsx) continua
-    gravando só em current.json.gz nesta fase; se ele for MAIS NOVO que o
-    summary já publicado, servir o summary antigo esconderia o upload manual
-    do usuário. Comparamos uploadedAt dos dois lados (não hasData, que os
-    dois quase sempre têm) para decidir. Retorna (summary, chunks_legados) —
-    chunks_legados é None quando o summary publicado é a fonte ativa (nesse
-    caso o chamador deve usar read_catalog_chunk(period), os blocos
-    publicados de verdade); é um dict quando a fonte ativa é o legado
-    derivado on-the-fly (o chamador já tem os chunks prontos ali)."""
+    gravando só em current.json.gz nesta fase; se ele trouxer dado REAL mais
+    novo que o summary já publicado, servir o summary antigo esconderia o
+    upload manual do usuário.
+
+    A comparação é pela maior "data" real de cada lado (lastSourceDataAt —
+    o mesmo carimbo do guard de frescor, "o dado em si", nunca a hora do
+    upload), não por uploadedAt (hora do relógio): os dois lados são
+    publicados na MESMA rodada de sync (legado primeiro, chunks/summary
+    depois — ver scripts/sync_postgres_pausados.py::main), então uploadedAt
+    do legado é sempre um pouco mais antigo nesse fluxo normal; comparando
+    por uploadedAt, quando a publicação em chunks falha uma única vez (o
+    upload legado continua, best-effort, tentando de novo a cada rodada —
+    ver o try/except em main()), o legado passa a ter o uploadedAt mais
+    recente e o comparador antigo trocava para ele — mesmo que seu
+    histórico já tivesse sido encolhido por trim_payload_to_fit (poucas
+    semanas) enquanto o summary publicado ainda tinha os 3 meses completos.
+    Isso fazia o frontend receber um histórico bem mais curto do que o
+    realmente publicado (foi o que causou o calendário do "Personalizado"
+    mostrar quase todo agosto como indisponível). Só cai para o legado
+    quando ele de fato tem um dado mais novo de verdade; se algum dos dois
+    lados não tiver lastSourceDataAt (nunca deveria acontecer em produção,
+    mas por segurança), volta ao comparador antigo por uploadedAt.
+
+    Rede de segurança adicional (nunca perder mês já publicado): mesmo
+    quando o legado "vence" essa escolha, o networkHistory/unitHistory
+    devolvidos são a UNIÃO com o que o summary novo já tinha publicado —
+    nunca a substituição — porque o legado pode ter vencido só por ter um
+    dado mais recente numa ponta (ex.: o dia de hoje) enquanto ainda está
+    mais curto na outra ponta (meses antigos já publicados em chunks). Sem
+    essa união, cada vez que o legado "vencesse" por qualquer motivo
+    voltaríamos a perder meses inteiros do histórico servido ao frontend.
+
+    Retorna (summary, chunks_legados) — chunks_legados é None quando o
+    summary publicado é a fonte ativa (nesse caso o chamador deve usar
+    read_catalog_chunk(period), os blocos publicados de verdade); é um dict
+    quando a fonte ativa é o legado derivado on-the-fly (o chamador já tem
+    os chunks prontos ali)."""
     summary = await read_summary_payload()
     legacy = await read_current_payload()
     if legacy is not None:
-        legacy_uploaded_at = legacy.get("uploadedAt") or ""
-        summary_uploaded_at = (summary or {}).get("uploadedAt") or ""
-        if not summary or legacy_uploaded_at > summary_uploaded_at:
+        legacy_data_at = _legacy_metadata_row(legacy).get("lastSourceDataAt") or ""
+        summary_data_at = (summary or {}).get("lastSourceDataAt") or ""
+        if legacy_data_at and summary_data_at:
+            legacy_is_newer = legacy_data_at > summary_data_at
+        else:
+            legacy_is_newer = (legacy.get("uploadedAt") or "") > ((summary or {}).get("uploadedAt") or "")
+        if not summary or legacy_is_newer:
             legacy_summary, legacy_chunks = _legacy_chunks_and_summary(legacy)
+            if summary:
+                legacy_summary = {
+                    **legacy_summary,
+                    "networkHistory": _merge_history_entries(
+                        summary.get("networkHistory"), legacy_summary.get("networkHistory"),
+                        lambda e: f"{e.get('date')}|{e.get('shift') or ''}",
+                    ),
+                    "unitHistory": _merge_history_entries(
+                        summary.get("unitHistory"), legacy_summary.get("unitHistory"),
+                        lambda e: f"{e.get('label')}|{e.get('date')}|{e.get('shift') or ''}",
+                    ),
+                }
+                combined_latest = max(
+                    (v for v in (legacy_summary.get("effectiveTo"), summary.get("effectiveTo")) if v),
+                    default=None,
+                )
+                if combined_latest:
+                    legacy_summary["effectiveTo"] = combined_latest
+                    legacy_summary["effectiveFrom"] = catalog_chunks.cutoff_from(
+                        combined_latest, catalog_chunks.WINDOW_MONTHS,
+                    )
             return legacy_summary, legacy_chunks
     if summary is not None:
         return summary, None

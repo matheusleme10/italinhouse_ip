@@ -399,3 +399,132 @@ def test_manual_upload_publishes_chunks_merging_and_cleans_up_old_months(monkeyp
     summary = asyncio.run(main_module.read_summary_payload())
     assert summary["effectiveTo"] == "2026-09-25"
     assert summary["effectiveFrom"] == cutoff_from("2026-09-25", sync_mod.WINDOW_MONTHS)
+
+
+# --- Diagnóstico do bug reportado: calendário do "Personalizado" mostra
+# agosto quase todo indisponível, exceto 31/08 --------------------------
+#
+# Causa raiz confirmada (ver diagnóstico completo na resposta ao usuário):
+# GET /api/data/summary e scripts/sync_postgres_pausados.py::publish_chunked
+# _snapshot (via fetch_summary, que lê pela MESMA rota HTTP) decidem entre o
+# summary novo (publicado com chunks) e uma derivação on-the-fly do
+# current.json.gz legado através de _active_summary_source. Antes desta
+# correção essa escolha era tudo-ou-nada: o lado "vencedor" (por
+# uploadedAt/hora do relógio, ou mesmo por ter um dado real mais novo numa
+# ponta) SUBSTITUÍA o outro por completo. Como o legado é sujeito ao corte
+# por tamanho de trim_payload_to_fit (retém só as últimas semanas), sempre
+# que ele "vencia" — mesmo corretamente, por ter o dia de hoje mais fresco —
+# o frontend passava a receber um networkHistory/unitHistory (e portanto um
+# sortedDates) bem mais curto que o summary já publicado tinha, mesmo sem
+# nenhum dado ter sido perdido no Postgres/migração. Exatamente o sintoma
+# relatado (julho e quase todo agosto "sem carga", só o fim de agosto e
+# setembro disponíveis).
+#
+# Correção aplicada em backend/main.py::_active_summary_source: (1) a
+# comparação agora usa lastSourceDataAt (o dado real) em vez de uploadedAt
+# (hora do relógio) quando os dois lados o têm; (2) rede de segurança
+# adicional — mesmo quando o legado "vence", o networkHistory/unitHistory
+# devolvido é a UNIÃO com o que o summary novo já tinha publicado, nunca uma
+# substituição. É essa união que garante que nenhum mês já publicado
+# desapareça, seja qual for o motivo de o legado ter "vencido" a escolha.
+def test_stale_legacy_upload_does_not_shrink_published_summary_history(monkeypatch, tmp_path):
+    """Prova a causa raiz e a correção: mesmo quando o legado tem dado real
+    mais novo que o summary publicado (e por isso corretamente "vence" a
+    escolha de fonte ativa), nenhuma data de julho/agosto que o summary
+    novo já tinha publicado pode desaparecer da resposta de
+    GET /api/data/summary — a união precisa preservar os dois lados."""
+    admin_password = "senha-admin-teste-diagnostico"
+    monkeypatch.setenv("ADMIN_PASSWORD_HASH", hashlib.sha256(admin_password.encode()).hexdigest())
+    monkeypatch.setenv("SESSION_SECRET", "segredo-de-sessao-com-mais-de-trinta-e-dois-caracteres")
+    monkeypatch.setattr(main_module, "BLOB_TOKEN", "")
+    monkeypatch.setattr(main_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main_module, "CURRENT_DATA", tmp_path / "current.json.gz")
+    monkeypatch.setattr(main_module, "SUMMARY_DATA", tmp_path / "summary.json.gz")
+    monkeypatch.setattr(main_module, "CATALOG_CHUNKS_DIR", tmp_path / "catalog-chunks")
+    monkeypatch.setattr(main_module, "_CURRENT_PAYLOAD_CACHE", None)
+    monkeypatch.setattr(main_module, "_SUMMARY_CACHE", None)
+    monkeypatch.setattr(main_module, "_CATALOG_CHUNK_CACHE", {})
+    monkeypatch.setattr(main_module, "_LEGACY_CHUNKS_CACHE", None)
+
+    # 1) Summary novo já publicado com a janela completa de 3 meses
+    # (jul/ago/set), uploadedAt mais ANTIGO (a publicação em chunks
+    # aconteceu numa rodada de sync anterior).
+    full_network_history = (
+        [{"date": f"2026-07-{d:02d}", "shift": "Jantar", "activeItems": 10, "pausedItems": 0, "totalItems": 10}
+         for d in range(24, 32)]
+        + [{"date": f"2026-08-{d:02d}", "shift": "Jantar", "activeItems": 10, "pausedItems": 0, "totalItems": 10}
+           for d in [3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 24, 25, 26, 27, 28, 31]]
+        + [{"date": f"2026-09-{d:02d}", "shift": "Jantar", "activeItems": 10, "pausedItems": 0, "totalItems": 10}
+           for d in range(1, 26)]
+    )
+    asyncio.run(main_module.write_summary_payload({
+        "networkHistory": full_network_history,
+        "unitHistory": [],
+        "unitStats": [],
+        "dataShift": "Jantar",
+        "lastSourceDataAt": "2026-09-25T20:00:00",
+        "uploadedAt": "2026-09-25T20:05:00+00:00",
+        "effectiveFrom": "2026-06-25",
+        "effectiveTo": "2026-09-25",
+        "chunks": {},
+    }))
+
+    # 2) Upload legado ocorre DEPOIS (uploadedAt mais novo), mas seu
+    # histórico já foi encolhido por trim_payload_to_fit — só tem as
+    # últimas semanas (31/08 em diante). Nenhuma linha real foi perdida
+    # no Postgres/migração — é só o current.json.gz legado que está
+    # menor, exatamente como trim_payload_to_fit já documenta que pode
+    # acontecer.
+    shrunk_network_history = (
+        [{"date": "2026-08-31", "shift": "Jantar", "activeItems": 10, "pausedItems": 0, "totalItems": 10}]
+        + [{"date": f"2026-09-{d:02d}", "shift": "Jantar", "activeItems": 10, "pausedItems": 0, "totalItems": 10}
+           for d in range(1, 29)]
+    )
+    asyncio.run(main_module.write_current_payload({
+        "rows": [{
+            "loja": "Loja A", "status": "Ativo",
+            "networkHistory": shrunk_network_history,
+            "unitHistory": [],
+            "dataShift": "Jantar",
+            "lastSourceDataAt": "2026-09-28T20:00:00",
+            # _legacy_chunks_and_summary só reconhece a linha "meta" se ela
+            # tiver networkSummary/catalogRows/catalogCube truthy — no
+            # sync real via Postgres o catalogCube da rodada sempre existe
+            # (build_cube_and_history sempre devolve o dict, mesmo que
+            # "records" venha vazio), então reproduzimos isso aqui.
+            "catalogCube": {
+                "version": 1, "stores": [], "items": [], "categories": [],
+                "dates": [], "shifts": [], "records": [],
+            },
+        }],
+        "totalRows": 1,
+        "uploadedAt": "2026-09-28T20:05:00+00:00",
+    }))
+
+    with TestClient(main_module.app) as client:
+        login = client.post("/api/session", json={"password": admin_password})
+        assert login.status_code == 200
+        response = client.get("/api/data/summary")
+        assert response.status_code == 200
+        body = response.json()
+
+    served_dates = {entry["date"] for entry in body.get("networkHistory", [])}
+    agosto_publicado = {e["date"] for e in full_network_history if e["date"].startswith("2026-08")}
+    julho_publicado = {e["date"] for e in full_network_history if e["date"].startswith("2026-07")}
+
+    # O legado tem dado real mais novo (28/09 vs 25/09 do summary) — é
+    # correto ele "vencer" a escolha de fonte ativa. Mas nenhuma data de
+    # julho/agosto que o summary novo já tinha publicado pode desaparecer
+    # por causa disso: a rede de segurança de merge em
+    # _active_summary_source garante que o resultado servido é a UNIÃO,
+    # não a substituição.
+    assert not (agosto_publicado - served_dates), (
+        "Datas de agosto já publicadas no summary novo desapareceram do "
+        "GET /api/data/summary — a causa raiz (legado 'vencendo' e "
+        "descartando meses do summary publicado) não foi corrigida."
+    )
+    assert not (julho_publicado - served_dates), "Mesmo problema, agora em julho."
+    # E o dado mais recente do legado (28/09) continua presente — a união
+    # não perde nada de nenhum dos dois lados.
+    assert "2026-09-28" in served_dates
+    assert "2026-08-31" in served_dates
