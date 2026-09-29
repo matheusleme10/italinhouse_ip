@@ -250,6 +250,160 @@ def test_migration_reconstructs_jul_ago_set_directly_from_postgres(monkeypatch):
     assert set(published_summary["chunks"]) == {"2026-07", "2026-08", "2026-09"}
 
 
+# --- Reparo pontual de networkHistory/unitHistory (--repair-history-only) ---
+#
+# Cenário do bug real: o summary publicado ficou raso (só uma cauda de
+# setembro + um dia solto de agosto — exatamente o que foi confirmado em
+# produção via GET /api/data/summary), mas o PostgreSQL tem jul/ago/set
+# completos. O reparo reconstrói networkHistory/unitHistory inteiramente do
+# Postgres e publica de volta, preservando chunks/manifest intocados.
+def test_repair_summary_history_recovers_full_window_from_postgres_without_touching_chunks(monkeypatch):
+    # Postgres "de verdade" tem jul/ago/set completos (aqui um dia por mês
+    # é suficiente pra provar a reconstrução — o teste de meses reconstruídos
+    # já existe em test_migration_reconstructs_jul_ago_set_directly_from_postgres).
+    max_date_value = datetime(2026, 9, 28, 17, 20, 27)
+    pg_rows = [
+        {
+            "lojas_simple_name": "Loja A", "categories_name": "C", "rows_name": "X",
+            "status": "Ativo", "price_value": 10.0, "data": datetime(2026, 7, 24, 20, 0, 0),
+        },
+        {
+            "lojas_simple_name": "Loja A", "categories_name": "C", "rows_name": "Y",
+            "status": "Pausado", "price_value": 20.0, "data": datetime(2026, 8, 10, 20, 0, 0),
+        },
+        {
+            "lojas_simple_name": "Loja A", "categories_name": "C", "rows_name": "Y",
+            "status": "Pausado", "price_value": 20.0, "data": datetime(2026, 8, 31, 20, 0, 0),
+        },
+        {
+            "lojas_simple_name": "Loja B", "categories_name": "C", "rows_name": "Z",
+            "status": "Ativo", "price_value": 30.0, "data": datetime(2026, 9, 28, 17, 20, 27),
+        },
+    ]
+
+    def fake_connect(**kwargs):
+        return _FakeConn(max_date_value, pg_rows)
+
+    monkeypatch.setattr(migrate_mod.psycopg2, "connect", fake_connect)
+    monkeypatch.setattr(migrate_mod, "login", lambda session, base_url, password: None)
+
+    # O summary ATUALMENTE publicado (raso) — o mesmo formato confirmado em
+    # produção: só uma cauda de setembro + um dia isolado de agosto, mas com
+    # chunks/manifest e outros metadados já corretos (jul/ago/set), que o
+    # reparo NUNCA deve tocar.
+    shallow_summary = {
+        "hasData": True,
+        "networkSummary": {"algumCampo": True},
+        "networkHistory": [
+            {"date": "2026-08-31", "shift": "Jantar", "activeItems": 1, "pausedItems": 0, "totalItems": 1},
+            {"date": "2026-09-28", "shift": "Jantar", "activeItems": 1, "pausedItems": 0, "totalItems": 1},
+        ],
+        "unitHistory": [
+            {"label": "Loja A", "date": "2026-08-31", "shift": "Jantar", "active": 1, "paused": 0, "total": 1},
+            {"label": "Loja A", "date": "2026-09-28", "shift": "Jantar", "active": 1, "paused": 0, "total": 1},
+        ],
+        "unitStats": [{"label": "Loja A"}],
+        "dataShift": "Jantar",
+        "lastSourceDataAt": "2026-09-28T17:20:27",
+        "uploadedAt": "2026-09-28T23:22:45+00:00",
+        "effectiveFrom": "2026-06-28",
+        "effectiveTo": "2026-09-28",
+        "chunks": {
+            "2026-07": {"updatedAt": "2026-09-01T00:00:00+00:00", "recordCount": 10},
+            "2026-08": {"updatedAt": "2026-09-01T00:00:00+00:00", "recordCount": 20},
+            "2026-09": {"updatedAt": "2026-09-28T23:22:11+00:00", "recordCount": 30},
+        },
+    }
+    monkeypatch.setattr(migrate_mod, "fetch_summary", lambda session, base_url: dict(shallow_summary))
+
+    published_summary: dict = {}
+    monkeypatch.setattr(
+        migrate_mod, "upload_summary",
+        lambda session, base_url, summary: published_summary.update(summary) or {"success": True},
+    )
+    # Nenhum chunk deveria ser publicado/apagado por este modo — se o teste
+    # chamar qualquer uma dessas funções, o teste falha explicitamente.
+    monkeypatch.setattr(
+        migrate_mod, "upload_catalog_chunk",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("repair_summary_history não deveria publicar chunks")),
+    )
+
+    monkeypatch.setenv("DB_HOST", "db.invalid")
+    monkeypatch.setenv("DB_NAME", "postgres")
+    monkeypatch.setenv("DB_USER", "user")
+    monkeypatch.setenv("DB_PASSWORD", "senha-fake-de-teste")
+    monkeypatch.setenv("DASHBOARD_PUBLIC_URL", "https://example.test")
+    monkeypatch.setenv("DASHBOARD_ADMIN_PASSWORD", "senha-admin-fake-de-teste")
+    monkeypatch.setattr("sys.argv", ["migrate_catalog_chunks.py", "--repair-history-only"])
+
+    exit_code = migrate_mod.main()
+
+    assert exit_code == 0
+    # O summary recuperou TODAS as datas (jul/ago/set), não só as 2 do summary raso.
+    published_dates = {e["date"] for e in published_summary["networkHistory"]}
+    assert published_dates == {"2026-07-24", "2026-08-10", "2026-08-31", "2026-09-28"}
+    published_unit_dates = {e["date"] for e in published_summary["unitHistory"]}
+    assert published_unit_dates == {"2026-07-24", "2026-08-10", "2026-08-31", "2026-09-28"}
+    # Chunks/manifest permanecem EXATAMENTE como estavam — não foram tocados.
+    assert published_summary["chunks"] == shallow_summary["chunks"]
+    # Metadados não relacionados a histórico também são preservados do summary existente.
+    assert published_summary["networkSummary"] == {"algumCampo": True}
+    assert published_summary["unitStats"] == [{"label": "Loja A"}]
+    assert published_summary["dataShift"] == "Jantar"
+    # effectiveFrom/effectiveTo/lastSourceDataAt recalculados a partir do MAX(data) real.
+    assert published_summary["effectiveTo"] == "2026-09-28"
+    assert published_summary["effectiveFrom"] == cutoff_from("2026-09-28", sync_mod.WINDOW_MONTHS)
+    assert published_summary["lastSourceDataAt"] == "2026-09-28T23:59:59"
+
+
+def test_repair_summary_history_aborts_if_reconstruction_has_fewer_dates_than_published(monkeypatch):
+    # Cenário de segurança: se por algum motivo a leitura do Postgres desta
+    # rodada vier mais curta que o summary já publicado, o reparo NUNCA deve
+    # publicar (evita piorar as coisas) — a menos que --force seja passado.
+    max_date_value = datetime(2026, 9, 28, 17, 20, 27)
+    pg_rows = [
+        {
+            "lojas_simple_name": "Loja A", "categories_name": "C", "rows_name": "X",
+            "status": "Ativo", "price_value": 10.0, "data": datetime(2026, 9, 28, 17, 20, 27),
+        },
+    ]
+
+    def fake_connect(**kwargs):
+        return _FakeConn(max_date_value, pg_rows)
+
+    monkeypatch.setattr(migrate_mod.psycopg2, "connect", fake_connect)
+    monkeypatch.setattr(migrate_mod, "login", lambda session, base_url, password: None)
+
+    rich_summary = {
+        "networkHistory": [
+            {"date": d, "shift": "Jantar", "activeItems": 1, "pausedItems": 0, "totalItems": 1}
+            for d in ("2026-07-24", "2026-08-10", "2026-08-31", "2026-09-28")
+        ],
+        "unitHistory": [],
+        "chunks": {"2026-07": {}, "2026-08": {}, "2026-09": {}},
+    }
+    monkeypatch.setattr(migrate_mod, "fetch_summary", lambda session, base_url: dict(rich_summary))
+
+    published_summary: dict = {}
+    monkeypatch.setattr(
+        migrate_mod, "upload_summary",
+        lambda session, base_url, summary: published_summary.update(summary) or {"success": True},
+    )
+
+    monkeypatch.setenv("DB_HOST", "db.invalid")
+    monkeypatch.setenv("DB_NAME", "postgres")
+    monkeypatch.setenv("DB_USER", "user")
+    monkeypatch.setenv("DB_PASSWORD", "senha-fake-de-teste")
+    monkeypatch.setenv("DASHBOARD_PUBLIC_URL", "https://example.test")
+    monkeypatch.setenv("DASHBOARD_ADMIN_PASSWORD", "senha-admin-fake-de-teste")
+    monkeypatch.setattr("sys.argv", ["migrate_catalog_chunks.py", "--repair-history-only"])
+
+    exit_code = migrate_mod.main()
+
+    assert exit_code == 1
+    assert published_summary == {}  # nada foi publicado
+
+
 # --- Retenção automática: nunca apaga um mês necessário para a janela ---
 
 def test_months_safe_to_delete_never_includes_effective_from_month_or_later():
