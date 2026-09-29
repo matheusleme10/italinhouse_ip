@@ -30,6 +30,10 @@ on:
         description: "Só mostrar o que seria publicado, sem publicar nada (true/false)"
         required: false
         default: "false"
+      repair_history_only:
+        description: "Reparo pontual: só reconstrói networkHistory/unitHistory do Postgres, sem tocar em catalog-chunks (true/false). Ver scripts/migrate_catalog_chunks.py::repair_summary_history."
+        required: false
+        default: "false"
 
 jobs:
   migrar:
@@ -57,8 +61,12 @@ jobs:
           DASHBOARD_PUBLIC_URL: ${{ secrets.DASHBOARD_PUBLIC_URL }}
           DASHBOARD_ADMIN_PASSWORD: ${{ secrets.DASHBOARD_ADMIN_PASSWORD }}
         run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            python scripts/migrate_catalog_chunks.py --dry-run
-          else
-            python scripts/migrate_catalog_chunks.py
+          ARGS=""
+          if [ "${{ inputs.repair_history_only }}" = "true" ]; then
+            ARGS="$ARGS --repair-history-only"
           fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          echo "Executando: python scripts/migrate_catalog_chunks.py$ARGS"
+          python scripts/migrate_catalog_chunks.py $ARGS
