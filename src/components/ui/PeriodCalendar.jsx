@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { formatDateBR } from '../../utils/format.js';
+import { calendarMonthBounds } from '../../utils/period.js';
 
 // Calendário visual de intervalo, feito à mão (não há lib de date-picker nas
 // dependências do projeto — ver package.json). `dates` é sempre a lista de
@@ -14,8 +15,13 @@ const WEEKDAYS = ['D', 'S', 'T', 'Q', 'Q', 'S', 'S'];
 
 export function PeriodCalendar({ dates, from, to, onSelect, onApply, onCancel }) {
   const dateSet = useMemo(() => new Set(dates), [dates]);
-  const minMonth = monthKey(dates[0]);
-  const maxMonth = monthKey(dates.at(-1));
+  // minMonth/maxMonth vêm SEMPRE da lista completa `dates` (todo o
+  // histórico publicado em effectiveFrom/effectiveTo, ver App.jsx::
+  // sortedDates) — nunca das datas do preset atualmente selecionado nem dos
+  // chunks já carregados na tela. Extraído pra period.js::calendarMonthBounds
+  // pra ser testável sem montar este componente (ver
+  // scripts/validar_calendario_personalizado.mjs).
+  const { minMonth, maxMonth } = calendarMonthBounds(dates);
   const [viewMonth, setViewMonth] = useState(monthKey(to || dates.at(-1)));
 
   const [year, month] = viewMonth.split('-').map(Number);

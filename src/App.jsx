@@ -17,7 +17,7 @@ import {
   getSyncTriggerStatus, loadCatalogChunk, loadDataRemote, loadSummaryRemote, triggerSyncNow,
 } from './utils/remote-storage.js';
 import { combineCatalogCubes } from './utils/merge.js';
-import { monthsBetween, resolvePeriodRange } from './utils/period.js';
+import { compareShifts, monthsBetween, resolvePeriodRange } from './utils/period.js';
 import { PortalLogin } from './components/PortalLogin.jsx';
 import { BrandSelector } from './components/BrandSelector.jsx';
 import { PotentialAccessGate } from './components/PotentialAccessGate.jsx';
@@ -248,7 +248,9 @@ export function App() {
       const result = await triggerSyncNow();
       setSyncTrigger({ status: 'requested', error: null, cooldownRemaining: result.cooldownSeconds || 0 });
     } catch (error) {
-      setSyncTrigger({ status: 'idle', error: error.message, cooldownRemaining: 0 });
+      // 'failed' (não 'idle') é o que liga o estilo de erro do botão
+      // (is-error) e o rótulo "Falha na atualização" — ver PortalHeader.jsx.
+      setSyncTrigger({ status: 'failed', error: error.message, cooldownRemaining: 0 });
     }
   }
 
@@ -281,13 +283,18 @@ export function App() {
     // fonte para descobrir a última data/turno disponível.
     const availableLoads = networkHistoryList.length ? networkHistoryList : unitHistory;
     if (!availableLoads.length) return null;
+    // Em caso de empate de data, o turno cronologicamente mais tarde vence
+    // (Jantar > Almoço, sempre — ver compareShifts). ANTES comparava
+    // `a.shift === metadata.dataShift`, um rótulo residual que a
+    // sincronização automática do Postgres nunca recalcula (fica travado no
+    // valor do último upload manual de planilha) — isso fazia uma carga de
+    // Jantar do mesmo dia perder pra uma de Almoço sempre que dataShift
+    // estivesse (incorretamente) travado em "Almoço".
     return [...availableLoads].sort((a, b) => {
       if (a.date !== b.date) return a.date < b.date ? -1 : 1;
-      if (a.shift === metadata.dataShift) return 1;
-      if (b.shift === metadata.dataShift) return -1;
-      return 0;
+      return compareShifts(a.shift, b.shift);
     }).at(-1);
-  }, [networkHistoryList, unitHistory, metadata.dataShift]);
+  }, [networkHistoryList, unitHistory]);
   const defaultDate = latestFullLoad?.date || lastDate;
   const defaultShift = latestFullLoad?.shift
     || (['Almoço', 'Jantar', 'Ambos'].includes(metadata.dataShift) ? metadata.dataShift : null)

@@ -253,6 +253,15 @@ GITHUB_SYNC_TOKEN = os.getenv("GITHUB_SYNC_TOKEN", "").strip()
 GITHUB_SYNC_REPO = os.getenv("GITHUB_SYNC_REPO", "matheusleme10/italinhouse_ip").strip()
 GITHUB_SYNC_WORKFLOW = os.getenv("GITHUB_SYNC_WORKFLOW", "sync-postgres.yml").strip()
 GITHUB_SYNC_REF = os.getenv("GITHUB_SYNC_REF", "main").strip()
+
+# POST /api/data/scheduled-sync — mesmo disparo do botão admin, mas pensado
+# pra ser chamado por um cron externo (cron-job.org), já que o `schedule:`
+# nativo do GitHub Actions pode atrasar horas em repositórios gratuitos (ver
+# diagnóstico). Autenticação própria e simples (bearer token fixo), porque
+# quem chama não tem sessão de admin/franqueado: CRON_SECRET só existe aqui,
+# como variável de ambiente do servidor. O frontend nunca vê esse valor nem
+# GITHUB_SYNC_TOKEN — nenhum dos dois é enviado em nenhuma resposta de API.
+CRON_SECRET = os.getenv("CRON_SECRET", "").strip()
 SYNC_TRIGGER_COOLDOWN_SECONDS = 120
 SYNC_TRIGGER_STATE: dict = {
     "lastTriggeredAt": 0.0,
@@ -2047,21 +2056,22 @@ async def _fetch_recent_workflow_runs(http_client: httpx.AsyncClient) -> list[di
     return response.json().get("workflow_runs", [])
 
 
-@app.post("/api/data/sync-now")
-async def trigger_sync_now(request: Request) -> dict:
-    """Dispara manualmente o workflow_dispatch do sync-postgres.yml (mesmo
-    workflow do cron automático de 15:20/20:20 BRT). Só admin, com cooldown
-    para não deixar clique duplo/repetido disparar várias execuções ao mesmo
-    tempo. O GitHub só confirma que ACEITOU o disparo (204) — não que o sync
-    já terminou; guardamos triggeredAt + o uploadedAt de agora (antes do
-    disparo) pra GET /api/data/sync-status conseguir acompanhar o run real
-    depois (ver _find_matching_run / _map_run_status_to_outcome)."""
-    if require_session(request) != "admin":
-        raise HTTPException(status_code=403, detail="Apenas administradores podem disparar a sincronização.")
+async def _trigger_sync_workflow() -> dict:
+    """Lógica compartilhada de disparo do workflow_dispatch do
+    sync-postgres.yml. Usada tanto pelo botão admin (POST /api/data/sync-now)
+    quanto pelo endpoint de cron externo (POST /api/data/scheduled-sync) —
+    as duas entradas passam pelo MESMO guard de concorrência/cooldown
+    (SYNC_TRIGGER_STATE), então um clique do admin e um disparo do
+    cron-job.org nunca colocam dois runs na fila ao mesmo tempo. O chamador
+    é responsável por autenticar antes de chamar esta função. O GitHub só
+    confirma que ACEITOU o disparo (204) — não que o sync já terminou;
+    guardamos triggeredAt + o uploadedAt de agora (antes do disparo) pra
+    GET /api/data/sync-status conseguir acompanhar o run real depois (ver
+    _find_matching_run / _map_run_status_to_outcome)."""
     if not GITHUB_SYNC_TOKEN:
         raise HTTPException(
             status_code=503,
-            detail="GITHUB_SYNC_TOKEN não configurado no backend — configure a variável de ambiente para habilitar este botão.",
+            detail="GITHUB_SYNC_TOKEN não configurado no backend — configure a variável de ambiente para habilitar este disparo.",
         )
     now = time.time()
     if SYNC_TRIGGER_STATE["inFlight"]:
@@ -2077,9 +2087,17 @@ async def trigger_sync_now(request: Request) -> dict:
 
     # Carimbo ANTES do POST de dispatch — representa o estado "como estava"
     # no momento do clique, pra depois sabermos se um run 'completed com
-    # sucesso' de fato trouxe dado novo ou não.
+    # sucesso' de fato trouxe dado novo ou não. Lê o uploadedAt do
+    # summary.json.gz (read_summary_payload), NÃO do current.json.gz legado
+    # (read_current_payload): scripts/sync_postgres_pausados.py — o script
+    # que este botão dispara — só publica em summary.json.gz/chunks
+    # (publish_chunked_snapshot), nunca em current.json.gz. current.json.gz
+    # só muda num upload manual de planilha; comparar por ele faria esse
+    # uploadedAt nunca mudar após um sync do Postgres, e GET
+    # /api/data/sync-status reportaria sempre 'no_new_data' mesmo quando a
+    # sincronização publicou dado novo de verdade.
     triggered_at_dt = datetime.now(timezone.utc)
-    uploaded_at_before = (await read_current_payload() or {}).get("uploadedAt")
+    uploaded_at_before = (await read_summary_payload() or {}).get("uploadedAt")
 
     SYNC_TRIGGER_STATE["inFlight"] = True
     try:
@@ -2113,6 +2131,39 @@ async def trigger_sync_now(request: Request) -> dict:
         "triggeredAt": SYNC_TRIGGER_STATE["triggeredAtIso"],
         "cooldownSeconds": SYNC_TRIGGER_COOLDOWN_SECONDS,
     }
+
+
+@app.post("/api/data/sync-now")
+async def trigger_sync_now(request: Request) -> dict:
+    """Dispara manualmente o workflow_dispatch do sync-postgres.yml (mesmo
+    workflow do cron automático de 15:20/20:20 BRT). Só admin — a lógica de
+    disparo/cooldown/concorrência em si está em _trigger_sync_workflow,
+    compartilhada com POST /api/data/scheduled-sync."""
+    if require_session(request) != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores podem disparar a sincronização.")
+    return await _trigger_sync_workflow()
+
+
+@app.post("/api/data/scheduled-sync")
+async def trigger_scheduled_sync(request: Request) -> dict:
+    """Disparo do sync-postgres.yml por um cron externo (cron-job.org), como
+    alternativa mais confiável ao `schedule:` nativo do GitHub Actions (que
+    pode atrasar horas em repositórios gratuitos). Não usa sessão de
+    admin/franqueado — quem chama é um serviço externo, não um usuário
+    logado no portal — e sim um bearer token fixo (CRON_SECRET), comparado
+    em tempo constante. Reaproveita o mesmo guard de concorrência/cooldown
+    de _trigger_sync_workflow, então um disparo do cron nunca corre em
+    paralelo com um clique do admin (ou com outro disparo duplicado do
+    próprio cron-job.org, por exemplo em caso de retry)."""
+    if not CRON_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="CRON_SECRET não configurado no backend — configure a variável de ambiente para habilitar este endpoint.",
+        )
+    scheme, _, token = (request.headers.get("authorization") or "").partition(" ")
+    if scheme.lower() != "bearer" or not token or not secrets.compare_digest(token, CRON_SECRET):
+        raise HTTPException(status_code=401, detail="Bearer token inválido ou ausente.")
+    return await _trigger_sync_workflow()
 
 
 @app.get("/api/data/sync-status")
@@ -2158,7 +2209,10 @@ async def sync_trigger_status(request: Request) -> dict:
         return {**base, "outcome": "unknown", "runId": None, "runUrl": None}
 
     matching_run = _find_matching_run(runs, triggered_at, GITHUB_SYNC_REF)
-    current_uploaded_at = (await read_current_payload() or {}).get("uploadedAt")
+    # Mesmo motivo do comentário em _trigger_sync_workflow: compara contra
+    # o summary.json.gz (fonte real do sync do Postgres), não o
+    # current.json.gz legado.
+    current_uploaded_at = (await read_summary_payload() or {}).get("uploadedAt")
     outcome = _map_run_status_to_outcome(
         matching_run, SYNC_TRIGGER_STATE.get("uploadedAtAtTrigger"), current_uploaded_at,
     )

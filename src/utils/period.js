@@ -40,6 +40,36 @@ export function lastLoadDates(dates, count) {
   return dates.slice(dates.length - n);
 }
 
+// Ordem cronológica fixa dos turnos DENTRO do mesmo dia — Jantar é sempre
+// depois de Almoço, por definição (backend/main.py e
+// scripts/sync_postgres_pausados.py::_shift_from_hour already decidem o
+// turno pela hora real da carga: hora < 17 -> Almoço, hora >= 17 -> Jantar).
+// Isso não depende de nenhum dado publicado (como summary.dataShift, que é
+// só um rótulo residual de upload manual, não um sinal de frescor) — dado um
+// mesmo dia, Jantar É mais recente que Almoço sempre, sem exceção.
+const SHIFT_ORDER = { 'Almoço': 0, 'Jantar': 1 };
+
+// Compara dois turnos pela ordem cronológica acima (>0 = a é depois de b).
+// Turno desconhecido/vazio fica sempre "antes" de um turno reconhecido —
+// lado conservador: nunca promove um valor que não reconhecemos a "mais
+// recente" só por ausência de informação.
+export function compareShifts(a, b) {
+  const orderA = SHIFT_ORDER[a] ?? -1;
+  const orderB = SHIFT_ORDER[b] ?? -1;
+  return orderA - orderB;
+}
+
+// minMonth/maxMonth navegáveis no calendário de período personalizado —
+// extraído de PeriodCalendar.jsx pra ser testável sem montar o componente
+// React. `dates` é sempre a lista completa de datas reais (já ordenada),
+// nunca as datas do preset/chunk atualmente carregado — é isso que garante
+// que trocar de preset (Última carga/7/14) ou já ter só um mês de chunk
+// carregado na tela nunca limite até onde o calendário pode navegar.
+export function calendarMonthBounds(dates) {
+  if (!Array.isArray(dates) || dates.length === 0) return { minMonth: null, maxMonth: null };
+  return { minMonth: dates[0].slice(0, 7), maxMonth: dates.at(-1).slice(0, 7) };
+}
+
 // Resolve {from, to} para um preset + a lista de datas reais disponíveis.
 // - 'last' -> última carga (from == to == última data real).
 // - '7'/'14' -> últimas 7/14 cargas reais (from = a mais antiga da janela).

@@ -131,6 +131,62 @@ def test_publish_chunked_snapshot_only_updates_touched_month(monkeypatch):
     assert published_summary == result
 
 
+# --- Cenário real de 30/09/2026: Almoço já publicado + rodada nova só com
+#     Jantar do MESMO dia -> o summary publicado tem que conter as DUAS
+#     entradas de networkHistory/unitHistory (nunca substituir uma pela
+#     outra) -- é _merge_history (union por chave date|shift) quem garante
+#     isso em publish_chunked_snapshot.
+def test_publish_chunked_snapshot_preserva_almoco_ao_publicar_jantar_do_mesmo_dia(monkeypatch):
+    existing_summary = {
+        "networkHistory": [{
+            "date": "2026-09-30", "shift": "Almoço",
+            "activeItems": 9, "pausedItems": 1, "totalItems": 10,
+            "pausedRevenue": 10.0, "activePct": 0.9, "pausedPct": 0.1,
+        }],
+        "unitHistory": [{
+            "label": "Loja A", "date": "2026-09-30", "shift": "Almoço",
+            "active": 9, "paused": 1, "total": 10, "pausedRevenue": 10.0, "pausedPct": 0.1,
+        }],
+        "unitStats": [], "dataShift": "Almoço",
+        "chunks": {"2026-09": {"updatedAt": "2026-09-30T08:40:00+00:00", "recordCount": 10}},
+    }
+    existing_chunks = {
+        "2026-09": {
+            "version": 1, "stores": ["Loja A"], "items": ["X"], "categories": ["C"],
+            "dates": ["2026-09-30"], "shifts": ["Almoço"], "records": [[0, 0, 0, 0, 0, 1, 10]],
+        },
+    }
+    uploaded_chunks: dict = {}
+    published_summary: dict = {}
+
+    monkeypatch.setattr(sync_mod, "fetch_summary", lambda session, base_url: existing_summary)
+    monkeypatch.setattr(sync_mod, "fetch_catalog_chunk", lambda session, base_url, period: existing_chunks.get(period))
+    monkeypatch.setattr(
+        sync_mod, "upload_catalog_chunk",
+        lambda session, base_url, period, cube: uploaded_chunks.__setitem__(period, cube) or {"success": True},
+    )
+    monkeypatch.setattr(sync_mod, "upload_summary", lambda session, base_url, summary: published_summary.update(summary))
+
+    # Rodada nova do Postgres: só traz a leitura das 16:09:31 (Jantar) — a
+    # mesma simulação de "o script só vê o que o banco tem agora", igual à
+    # rodada real do GitHub Actions #57 do incidente.
+    flat_rows = [_flat_row("Loja A", "X", "2026-09-30", "Jantar", "Ativo", 12.0)]
+    extra = sync_mod.build_cube_and_history(flat_rows)
+
+    result = sync_mod.publish_chunked_snapshot(
+        None, "https://example.test", flat_rows, extra, source_data_at="2026-09-30T16:09:31",
+    )
+
+    by_shift = {e["shift"]: e for e in result["networkHistory"]}
+    assert set(by_shift) == {"Almoço", "Jantar"}
+    assert by_shift["Almoço"]["date"] == "2026-09-30"  # entrada antiga preservada
+    assert by_shift["Jantar"]["date"] == "2026-09-30"  # entrada nova somada, não substituída
+    unit_by_shift = {e["shift"]: e for e in result["unitHistory"]}
+    assert set(unit_by_shift) == {"Almoço", "Jantar"}
+    assert result["lastSourceDataAt"] == "2026-09-30T16:09:31"
+    assert published_summary == result
+
+
 # --- 4) falha ao publicar um chunk nunca publica o summary/manifest ---
 
 def test_publish_chunked_snapshot_chunk_failure_never_publishes_summary(monkeypatch):

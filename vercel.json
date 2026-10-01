@@ -17,6 +17,8 @@
     { "source": "/api/data/summary/upload", "destination": "/api/index" },
     { "source": "/api/data/summary", "destination": "/api/index" },
     { "source": "/api/data/catalog-chunk/(.*)", "destination": "/api/index" },
+    { "source": "/api/data/sync-now",   "destination": "/api/index" },
+    { "source": "/api/data/sync-status", "destination": "/api/index" },
     { "source": "/api/data",        "destination": "/api/index" },
     { "source": "/(.*)",     "destination": "/index.html" }
   ]

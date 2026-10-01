@@ -561,3 +561,249 @@ def test_sync_status_falha_de_rede_no_github_devolve_outcome_unknown(monkeypatch
         # Nunca inventa sucesso/no_new_data quando não conseguimos consultar
         # o GitHub — estado indeterminado explícito.
         assert body["outcome"] == "unknown"
+
+
+class _FakeDispatchResponse:
+    def __init__(self, status_code=204):
+        self.status_code = status_code
+
+
+class _FakeDispatchClient:
+    """Substitui httpx.AsyncClient só pra POST /dispatches em
+    _trigger_sync_workflow — evita bater no GitHub de verdade nos testes de
+    POST /api/data/scheduled-sync, sem mexer na lógica real de dispatch."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def post(self, *args, **kwargs):
+        return _FakeDispatchResponse(204)
+
+
+def _reset_sync_trigger_state(monkeypatch):
+    monkeypatch.setattr(main_module, "SYNC_TRIGGER_STATE", {
+        "lastTriggeredAt": 0.0,
+        "inFlight": False,
+        "lastTriggeredBy": None,
+        "triggeredAtIso": None,
+        "uploadedAtAtTrigger": None,
+    })
+
+
+def test_scheduled_sync_com_segredo_correto_dispara_workflow(monkeypatch):
+    monkeypatch.setattr(main_module, "CRON_SECRET", "segredo-cron-teste")
+    monkeypatch.setattr(main_module, "GITHUB_SYNC_TOKEN", "token-de-teste")
+    monkeypatch.setattr(main_module.httpx, "AsyncClient", _FakeDispatchClient)
+    _reset_sync_trigger_state(monkeypatch)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/data/scheduled-sync",
+            headers={"Authorization": "Bearer segredo-cron-teste"},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["success"] is True
+        assert body["triggeredAt"]
+        # Nunca exposto na resposta.
+        assert "CRON_SECRET" not in json.dumps(body)
+        assert "segredo-cron-teste" not in json.dumps(body)
+        assert "GITHUB_SYNC_TOKEN" not in json.dumps(body)
+
+    # O disparo aceito atualizou o mesmo estado global lido por
+    # GET /api/data/sync-status e usado pelo cooldown do botão admin.
+    assert main_module.SYNC_TRIGGER_STATE["lastTriggeredAt"] > 0.0
+
+
+def test_scheduled_sync_sem_header_authorization_retorna_401(monkeypatch):
+    monkeypatch.setattr(main_module, "CRON_SECRET", "segredo-cron-teste")
+    monkeypatch.setattr(main_module, "GITHUB_SYNC_TOKEN", "token-de-teste")
+    monkeypatch.setattr(main_module.httpx, "AsyncClient", _FakeDispatchClient)
+    _reset_sync_trigger_state(monkeypatch)
+
+    with TestClient(app) as client:
+        response = client.post("/api/data/scheduled-sync")
+        assert response.status_code == 401
+        # Nada foi disparado.
+        assert main_module.SYNC_TRIGGER_STATE["lastTriggeredAt"] == 0.0
+
+
+def test_scheduled_sync_com_segredo_incorreto_retorna_401(monkeypatch):
+    monkeypatch.setattr(main_module, "CRON_SECRET", "segredo-cron-teste")
+    monkeypatch.setattr(main_module, "GITHUB_SYNC_TOKEN", "token-de-teste")
+    monkeypatch.setattr(main_module.httpx, "AsyncClient", _FakeDispatchClient)
+    _reset_sync_trigger_state(monkeypatch)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/data/scheduled-sync",
+            headers={"Authorization": "Bearer segredo-errado"},
+        )
+        assert response.status_code == 401
+        assert main_module.SYNC_TRIGGER_STATE["lastTriggeredAt"] == 0.0
+
+
+def test_scheduled_sync_chamada_duplicada_retorna_429(monkeypatch):
+    monkeypatch.setattr(main_module, "CRON_SECRET", "segredo-cron-teste")
+    monkeypatch.setattr(main_module, "GITHUB_SYNC_TOKEN", "token-de-teste")
+    monkeypatch.setattr(main_module.httpx, "AsyncClient", _FakeDispatchClient)
+    _reset_sync_trigger_state(monkeypatch)
+
+    with TestClient(app) as client:
+        headers = {"Authorization": "Bearer segredo-cron-teste"}
+        first = client.post("/api/data/scheduled-sync", headers=headers)
+        assert first.status_code == 200
+
+        # Retry/segunda chamada imediata (ex.: cron-job.org reenviando por
+        # timeout, ou o cron caindo no mesmo minuto que um clique do admin)
+        # tem que ser bloqueada pelo mesmo cooldown/guard de concorrência
+        # usado por POST /api/data/sync-now — nunca dois runs em paralelo.
+        second = client.post("/api/data/scheduled-sync", headers=headers)
+        assert second.status_code == 429
+        body = second.json()
+        assert "Aguarde" in body["detail"] or "andamento" in body["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Botão administrativo "Atualizar dados" (POST /api/data/sync-now) — cenários
+# pedidos explicitamente: configuração válida, token ausente, erro do
+# GitHub, cooldown, e nenhum secret aparecendo na resposta. Reaproveita
+# _FakeDispatchClient/_reset_sync_trigger_state já definidos acima.
+# ---------------------------------------------------------------------------
+
+def _login_admin(client, monkeypatch, password="admin-sync-now-test"):
+    LOGIN_ATTEMPTS.clear()
+    monkeypatch.setenv("ADMIN_PASSWORD_HASH", hashlib.sha256(password.encode()).hexdigest())
+    monkeypatch.setenv("SESSION_SECRET", "segredo-de-sessao-com-mais-de-trinta-e-dois-caracteres")
+    client.post("/api/session", json={"password": password})
+
+
+def test_sync_now_com_configuracao_valida_dispara_e_nao_expoe_token(monkeypatch):
+    monkeypatch.setattr(main_module, "GITHUB_SYNC_TOKEN", "token-de-teste")
+    monkeypatch.setattr(main_module.httpx, "AsyncClient", _FakeDispatchClient)
+    _reset_sync_trigger_state(monkeypatch)
+
+    with TestClient(app) as admin:
+        _login_admin(admin, monkeypatch)
+        response = admin.post("/api/data/sync-now")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["success"] is True
+        assert "token-de-teste" not in json.dumps(body)
+        assert "GITHUB_SYNC_TOKEN" not in json.dumps(body)
+
+
+def test_sync_now_sem_token_configurado(monkeypatch):
+    monkeypatch.setattr(main_module, "GITHUB_SYNC_TOKEN", "")
+    _reset_sync_trigger_state(monkeypatch)
+
+    with TestClient(app) as admin:
+        _login_admin(admin, monkeypatch)
+        response = admin.post("/api/data/sync-now")
+        assert response.status_code == 503
+        body = response.json()
+        assert "GITHUB_SYNC_TOKEN" in body["detail"]  # só o NOME da variável, nunca um valor
+        assert "token-de-teste" not in json.dumps(body)
+
+
+def test_sync_now_erro_retornado_pelo_github_vira_502(monkeypatch):
+    monkeypatch.setattr(main_module, "GITHUB_SYNC_TOKEN", "token-de-teste")
+    _reset_sync_trigger_state(monkeypatch)
+
+    class _FakeRejectedResponse:
+        status_code = 404  # ex.: workflow_dispatch não encontrado — token sem permissão/workflow errado
+
+    class _FakeRejectingClient(_FakeDispatchClient):
+        async def post(self, *args, **kwargs):
+            return _FakeRejectedResponse()
+
+    monkeypatch.setattr(main_module.httpx, "AsyncClient", _FakeRejectingClient)
+
+    with TestClient(app) as admin:
+        _login_admin(admin, monkeypatch)
+        response = admin.post("/api/data/sync-now")
+        assert response.status_code == 502
+        body = response.json()
+        assert "404" in body["detail"]
+        assert "token-de-teste" not in json.dumps(body)
+
+
+def test_sync_now_respeita_cooldown_entre_dois_cliques(monkeypatch):
+    monkeypatch.setattr(main_module, "GITHUB_SYNC_TOKEN", "token-de-teste")
+    monkeypatch.setattr(main_module.httpx, "AsyncClient", _FakeDispatchClient)
+    _reset_sync_trigger_state(monkeypatch)
+
+    with TestClient(app) as admin:
+        _login_admin(admin, monkeypatch)
+        first = admin.post("/api/data/sync-now")
+        assert first.status_code == 200
+        second = admin.post("/api/data/sync-now")
+        assert second.status_code == 429
+        assert "Aguarde" in second.json()["detail"]
+
+
+def test_sync_now_sem_sessao_retorna_401():
+    with TestClient(app) as client:
+        response = client.post("/api/data/sync-now")
+        # Sem sessão nenhuma: require_session levanta 401 antes mesmo da
+        # checagem de papel — "Sessão expirada" no frontend (ver
+        # SYNC_NOW_STATUS_FALLBACK em remote-storage.js).
+        assert response.status_code == 401
+
+
+def test_sync_status_usa_summary_uploadedat_nao_current_json_legado(monkeypatch):
+    # Regressão do bug real encontrado nesta rodada: scripts/
+    # sync_postgres_pausados.py só publica em summary.json.gz/chunks (nunca
+    # em current.json.gz), mas GET /api/data/sync-status comparava o
+    # uploadedAt do current.json.gz LEGADO pra decidir 'updated' vs
+    # 'no_new_data'. Como current.json.gz nunca muda nessa rodada, o botão
+    # ficaria preso em 'no_new_data' pra sempre, mesmo com a sincronização
+    # publicando dado novo de verdade (o cenário real de 30/09: run #57 com
+    # sucesso, mas o botão não refletia a publicação).
+    admin_password = "admin-summary-uploadedat-test"
+    LOGIN_ATTEMPTS.clear()
+    monkeypatch.setenv("ADMIN_PASSWORD_HASH", hashlib.sha256(admin_password.encode()).hexdigest())
+    monkeypatch.setenv("SESSION_SECRET", "segredo-de-sessao-com-mais-de-trinta-e-dois-caracteres")
+    monkeypatch.setattr(main_module, "GITHUB_SYNC_TOKEN", "token-de-teste")
+    monkeypatch.setattr(main_module, "SYNC_TRIGGER_STATE", {
+        "lastTriggeredAt": 0.0,
+        "inFlight": False,
+        "lastTriggeredBy": None,
+        "triggeredAtIso": "2026-09-30T19:00:00+00:00",
+        # Carimbado a partir do SUMMARY no momento do disparo (ver
+        # _trigger_sync_workflow corrigido nesta rodada).
+        "uploadedAtAtTrigger": "2026-09-30T19:00:00+00:00",
+    })
+
+    async def fake_current_payload():
+        # uploadedAt "congelado" — simula current.json.gz nunca mais tocado
+        # pela sincronização automática do Postgres.
+        return {"rows": [{"uploadedAt": "2020-01-01T00:00:00+00:00"}], "uploadedAt": "2020-01-01T00:00:00+00:00"}
+
+    async def fake_summary_payload():
+        # Isto é o que de fato mudou nesta rodada (a publicação real da
+        # carga das 16:09:31, já com o merge de Almoço+Jantar).
+        return {"uploadedAt": "2026-09-30T23:10:00+00:00"}
+
+    monkeypatch.setattr(main_module, "read_current_payload", fake_current_payload)
+    monkeypatch.setattr(main_module, "read_summary_payload", fake_summary_payload)
+
+    async def fake_runs(_http_client):
+        return [{
+            "event": "workflow_dispatch", "head_branch": main_module.GITHUB_SYNC_REF,
+            "created_at": "2026-09-30T19:00:05Z", "status": "completed", "conclusion": "success", "id": 57,
+        }]
+
+    monkeypatch.setattr(main_module, "_fetch_recent_workflow_runs", fake_runs)
+
+    with TestClient(app) as admin:
+        admin.post("/api/session", json={"password": admin_password})
+        response = admin.get("/api/data/sync-status")
+        assert response.status_code == 200
+        assert response.json()["outcome"] == "updated"

@@ -109,6 +109,20 @@ export async function loadDataRemote() {
   }
 }
 
+// Mensagem de reserva por status HTTP — só usada quando a resposta do
+// backend não vem com um `detail` (ex.: erro de rede, resposta não-JSON de
+// alguma camada intermediária). O backend normalmente já manda um `detail`
+// específico (ver POST /api/data/sync-now em backend/main.py), que sempre
+// tem prioridade sobre este mapa; isso é só a rede de segurança pra nunca
+// cair de volta numa mensagem genérica só porque o `detail` faltou.
+const SYNC_NOW_STATUS_FALLBACK = {
+  401: 'Sessão expirada — faça login novamente.',
+  403: 'Apenas administradores podem disparar a sincronização.',
+  429: 'Sincronização já em andamento — aguarde um instante.',
+  502: 'GitHub recusou o disparo do workflow.',
+  503: 'Configuração do sincronizador indisponível no backend.',
+};
+
 /**
  * Dispara o workflow_dispatch do sync-postgres.yml através do backend (o
  * token do GitHub nunca sai do servidor — ver POST /api/data/sync-now em
@@ -120,7 +134,8 @@ export async function triggerSyncNow() {
   const res = await fetch(`${API}/sync-now`, { method: 'POST', credentials: 'same-origin' });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(body.detail || 'Falha ao solicitar a sincronização.');
+    const fallback = SYNC_NOW_STATUS_FALLBACK[res.status] || `Falha ao solicitar a sincronização (HTTP ${res.status}).`;
+    throw new Error(body.detail || fallback);
   }
   return body;
 }

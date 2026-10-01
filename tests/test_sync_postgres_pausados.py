@@ -446,6 +446,19 @@ def test_guard_aceita_almoco_e_jantar_no_mesmo_dia():
     assert _guard_allows_upload(publicado, novo, force=False) is True
 
 
+def test_guard_aceita_cenario_real_30_09_08h37_para_16h09_mesmo_dia():
+    # Cenário real reportado em produção em 30/09/2026: publicado às 08:37:54,
+    # nova leitura do Postgres às 16:09:31, MESMO dia (independente de qual
+    # turno cada horário representa — ver investigação pendente sobre o
+    # corte Almoço/Jantar). O guard tem que aceitar — é exatamente o caso
+    # que a comparação por timestamp completo (não só ::date) existe para
+    # cobrir: uma carga mais nova no mesmo dia nunca pode ser tratada como
+    # stale só por compartilhar a mesma data.
+    publicado = datetime(2026, 9, 30, 8, 37, 54)
+    novo = datetime(2026, 9, 30, 16, 9, 31)
+    assert _guard_allows_upload(publicado, novo, force=False) is True
+
+
 def test_guard_bloqueia_quando_novo_e_igual_ou_anterior_ao_publicado():
     publicado = datetime(2026, 9, 25, 20, 15)
     igual = datetime(2026, 9, 25, 20, 15)
@@ -463,6 +476,34 @@ def test_guard_force_ignora_a_comparacao():
 def test_guard_permite_primeira_rodada_sem_snapshot_anterior():
     novo = datetime(2026, 9, 25, 20, 15)
     assert _guard_allows_upload(None, novo, force=False) is True
+
+
+def test_almoco_e_jantar_do_mesmo_dia_viram_duas_entradas_distintas_no_history():
+    # Prova que build_cube_and_history (a etapa de construção, ANTES de
+    # qualquer publicação/merge) preserva as duas cargas do mesmo dia como
+    # entradas SEPARADAS de networkHistory/unitHistory — nada se perde aqui.
+    # IMPORTANTE: pela regra ATUAL (_shift_from_hour: hora < 17 = Almoço,
+    # hora >= 17 = Jantar), 16:09:31 (o horário real relatado em produção em
+    # 30/09/2026) cai em "Almoço", não "Jantar" — ver investigação pendente
+    # sobre o corte de hora pedida pelo usuário antes de qualquer mudança de
+    # regra de negócio. Este teste usa um horário de Jantar inequívoco
+    # (19:00) só para validar que a ETAPA DE CONSTRUÇÃO em si não colapsa
+    # nem perde nenhuma das duas cargas quando elas realmente caem em turnos
+    # diferentes — independente de qual seja o corte de hora correto.
+    rows = [
+        _pg_row("Loja X", "Cat", "Item 1", "Ativo", 10, data=datetime(2026, 9, 30, 8, 37, 54)),
+        _pg_row("Loja X", "Cat", "Item 2", "Pausado", 20, data=datetime(2026, 9, 30, 19, 0, 0)),
+    ]
+    flat_rows, _ = build_flat_rows(rows)
+    assert {r["shift"] for r in flat_rows} == {"Almoço", "Jantar"}
+
+    extra = build_cube_and_history(_dedupe_flat_rows(flat_rows))
+    network_by_shift = {e["shift"]: e for e in extra["networkHistory"]}
+    assert set(network_by_shift) == {"Almoço", "Jantar"}
+    assert network_by_shift["Almoço"]["date"] == "2026-09-30"
+    assert network_by_shift["Jantar"]["date"] == "2026-09-30"
+    # catalogCube também guarda os dois turnos como registros distintos.
+    assert set(extra["catalogCube"]["shifts"]) == {"Almoço", "Jantar"}
 
 
 def test_merge_payload_grava_lastsourcedataat_no_snapshot():
