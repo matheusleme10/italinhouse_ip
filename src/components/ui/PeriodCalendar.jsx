@@ -8,7 +8,6 @@ import { calendarMonthBounds } from '../../utils/period.js';
 // carga"/presets usam — por isso o próprio limite de navegação (min/max mês)
 // e quais dias ficam clicáveis já respeitam effectiveFrom/effectiveTo sem
 // precisar repetir essa regra aqui.
-function monthKey(date) { return date.slice(0, 7); }
 function daysInMonth(year, month) { return new Date(year, month, 0).getDate(); }
 function pad(n) { return String(n).padStart(2, '0'); }
 const WEEKDAYS = ['D', 'S', 'T', 'Q', 'Q', 'S', 'S'];
@@ -22,7 +21,14 @@ export function PeriodCalendar({ dates, from, to, onSelect, onApply, onCancel })
   // pra ser testável sem montar este componente (ver
   // scripts/validar_calendario_personalizado.mjs).
   const { minMonth, maxMonth } = calendarMonthBounds(dates);
-  const [viewMonth, setViewMonth] = useState(monthKey(to || dates.at(-1)));
+  // Abre sempre no mês mais recente navegável (maxMonth — que agora é, no
+  // mínimo, o mês atual real, garantido por calendarMonthBounds), não mais
+  // em `to || dates.at(-1)`: se o período aplicado for antigo (ex.: só
+  // Setembro, por falta de carga em Outubro ainda), o usuário via o
+  // calendário abrir "preso" nesse mês antigo sem indicação de que dava pra
+  // navegar pra frente. A seleção (from/to) já fica destacada no grid
+  // independente de qual mês está sendo exibido no momento.
+  const [viewMonth, setViewMonth] = useState(maxMonth);
 
   const [year, month] = viewMonth.split('-').map(Number);
   const firstWeekday = new Date(year, month - 1, 1).getDay();

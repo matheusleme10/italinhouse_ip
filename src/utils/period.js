@@ -59,15 +59,59 @@ export function compareShifts(a, b) {
   return orderA - orderB;
 }
 
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+// Mês-calendário ('YYYY-MM') de "hoje", no fuso local do navegador. Mantido
+// como helper isolado (em vez de inline em calendarMonthBounds) só pra poder
+// ser sobrescrito via o parâmetro `todayMonth` em testes determinísticos
+// (ver scripts/validar_calendario_personalizado.mjs) sem precisar mockar
+// Date globalmente.
+export function currentMonthKey() {
+  const now = new Date();
+  return `${now.getFullYear()}-${pad2(now.getMonth() + 1)}`;
+}
+
+// 'YYYY-MM' + delta (positivo ou negativo) -> 'YYYY-MM', aritmética pura de
+// mês-calendário (nunca usa Date para isso — evita o problema de "dia
+// inexistente" ao somar meses via new Date(y, m+delta, 1) em alguns fusos).
+export function shiftMonthKey(monthKey, delta) {
+  const [y, m] = monthKey.split('-').map(Number);
+  const total = y * 12 + (m - 1) + delta;
+  const year = Math.floor(total / 12);
+  const month = (((total % 12) + 12) % 12) + 1;
+  return `${year}-${pad2(month)}`;
+}
+
 // minMonth/maxMonth navegáveis no calendário de período personalizado —
 // extraído de PeriodCalendar.jsx pra ser testável sem montar o componente
 // React. `dates` é sempre a lista completa de datas reais (já ordenada),
 // nunca as datas do preset/chunk atualmente carregado — é isso que garante
 // que trocar de preset (Última carga/7/14) ou já ter só um mês de chunk
 // carregado na tela nunca limite até onde o calendário pode navegar.
-export function calendarMonthBounds(dates) {
-  if (!Array.isArray(dates) || dates.length === 0) return { minMonth: null, maxMonth: null };
-  return { minMonth: dates[0].slice(0, 7), maxMonth: dates.at(-1).slice(0, 7) };
+//
+// Além disso, a janela navegável NUNCA é menor que [hoje - minWindowMonths,
+// mês atual] — mesmo que o histórico publicado (summary.networkHistory/
+// unitHistory) ainda esteja raso (ex.: logo após o deploy, antes de
+// --repair-history-only reconstruir o passado, ou se o sync do dia ainda não
+// rodou). Isso resolve o calendário "travado" num mês só porque o summary
+// publicado só tem aquele mês: a navegação sempre alcança o mês atual e pelo
+// menos os 3 meses anteriores, independentemente de quantos deles têm dias
+// realmente clicáveis (dias sem carga continuam desabilitados — isso aqui só
+// afeta até onde dá pra navegar, nunca quais dias ficam selecionáveis).
+// `todayMonth`/`minWindowMonths` são injetáveis só pra permitir testes
+// determinísticos (ver scripts/validar_calendario_personalizado.mjs);
+// chamadas reais (PeriodCalendar.jsx) usam os defaults.
+export function calendarMonthBounds(dates, { todayMonth = currentMonthKey(), minWindowMonths = 3 } = {}) {
+  const minWindowMonth = shiftMonthKey(todayMonth, -minWindowMonths);
+  if (!Array.isArray(dates) || dates.length === 0) {
+    return { minMonth: minWindowMonth, maxMonth: todayMonth };
+  }
+  const dataMinMonth = dates[0].slice(0, 7);
+  const dataMaxMonth = dates.at(-1).slice(0, 7);
+  return {
+    minMonth: dataMinMonth < minWindowMonth ? dataMinMonth : minWindowMonth,
+    maxMonth: dataMaxMonth > todayMonth ? dataMaxMonth : todayMonth,
+  };
 }
 
 // Resolve {from, to} para um preset + a lista de datas reais disponíveis.
