@@ -738,3 +738,196 @@ def test_stale_legacy_upload_does_not_shrink_published_summary_history(monkeypat
     # não perde nada de nenhum dos dois lados.
     assert "2026-09-28" in served_dates
     assert "2026-08-31" in served_dates
+
+
+# --- Erosão do histórico: sincronização normal (upload legado reduzido por
+#     trim_payload_to_fit -> _publish_chunks_from_payload) NUNCA pode encolher
+#     o networkHistory/unitHistory já publicado dentro da janela de retenção.
+#
+# Causa raiz: _publish_chunks_from_payload montava o summary SÓ com o
+# networkHistory/unitHistory do payload legado (reduzido) — usava o legado como
+# autoridade e apagava Julho/Agosto já publicados; publish_chunked_snapshot,
+# que roda logo depois, só mescla o que o Postgres devolve em
+# POSTGRES_LOOKBACK_DAYS, então o histórico nunca se recuperava sozinho.
+
+def _setup_local_storage(monkeypatch, tmp_path):
+    monkeypatch.setattr(main_module, "BLOB_TOKEN", "")
+    monkeypatch.setattr(main_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main_module, "CURRENT_DATA", tmp_path / "current.json.gz")
+    monkeypatch.setattr(main_module, "SUMMARY_DATA", tmp_path / "summary.json.gz")
+    monkeypatch.setattr(main_module, "CATALOG_CHUNKS_DIR", tmp_path / "catalog-chunks")
+    monkeypatch.setattr(main_module, "_CURRENT_PAYLOAD_CACHE", None)
+    monkeypatch.setattr(main_module, "_SUMMARY_CACHE", None)
+    monkeypatch.setattr(main_module, "_CATALOG_CHUNK_CACHE", {})
+    monkeypatch.setattr(main_module, "_LEGACY_CHUNKS_CACHE", None)
+
+
+def _net(date, shift="Jantar", active=10):
+    return {"date": date, "shift": shift, "activeItems": active, "pausedItems": 0, "totalItems": active}
+
+
+def _unit(date, label="Loja A", shift="Jantar", active=10):
+    return {"label": label, "date": date, "shift": shift, "active": active, "paused": 0, "total": active}
+
+
+def _legacy_payload(network, unit, last_source="2026-10-01T20:00:00"):
+    return {
+        "rows": [{
+            "loja": "Loja A", "status": "Ativo",
+            "networkHistory": network, "unitHistory": unit,
+            "dataShift": "Jantar", "lastSourceDataAt": last_source,
+            "catalogCube": {
+                "version": 1, "stores": ["Loja A"], "items": ["X"], "categories": ["C"],
+                "dates": ["2026-10-01"], "shifts": ["Jantar"], "records": [[0, 0, 0, 0, 0, 0, 10]],
+            },
+        }],
+        "totalRows": 1,
+        "uploadedAt": "2026-10-01T20:05:00+00:00",
+    }
+
+
+# Datas dentro da janela de 3 meses ancorada em 2026-10-01 (cutoff 2026-07-01).
+FULL_DATES = ["2026-07-02", "2026-07-15", "2026-08-03", "2026-08-31", "2026-09-15", "2026-09-30", "2026-10-01"]
+
+
+def test_publish_chunks_from_payload_nao_apaga_julho_agosto_com_payload_legado_reduzido(monkeypatch, tmp_path):
+    _setup_local_storage(monkeypatch, tmp_path)
+    asyncio.run(main_module.write_summary_payload({
+        "networkHistory": [_net(d) for d in FULL_DATES],
+        "unitHistory": [_unit(d) for d in FULL_DATES],
+        "unitStats": [], "dataShift": "Jantar",
+        "lastSourceDataAt": "2026-09-30T20:00:00", "uploadedAt": "2026-09-30T20:05:00+00:00",
+        "effectiveFrom": "2026-06-30", "effectiveTo": "2026-09-30", "chunks": {},
+    }))
+
+    # Payload legado reduzido por trim_payload_to_fit: só Setembro + Outubro.
+    reduced = ["2026-09-30", "2026-10-01"]
+    payload = _legacy_payload([_net(d) for d in reduced], [_unit(d) for d in reduced])
+    result = asyncio.run(main_module._publish_chunks_from_payload(payload))
+
+    summary = asyncio.run(main_module.read_summary_payload())
+    assert {e["date"] for e in summary["networkHistory"]} == set(FULL_DATES)
+    assert {e["date"] for e in summary["unitHistory"]} == set(FULL_DATES)
+    # Julho, Agosto, Setembro e Outubro continuam todos presentes.
+    months = {e["date"][:7] for e in summary["networkHistory"]}
+    assert months == {"2026-07", "2026-08", "2026-09", "2026-10"}
+    assert summary["effectiveTo"] == "2026-10-01"
+    assert summary["effectiveFrom"] == cutoff_from("2026-10-01", sync_mod.WINDOW_MONTHS) == "2026-07-01"
+    assert result["effectiveFrom"] == "2026-07-01"
+
+
+def test_publish_chunks_from_payload_dado_novo_vence_na_mesma_chave(monkeypatch, tmp_path):
+    _setup_local_storage(monkeypatch, tmp_path)
+    asyncio.run(main_module.write_summary_payload({
+        "networkHistory": [_net("2026-09-30", active=5), _net("2026-08-03", active=7)],
+        "unitHistory": [_unit("2026-09-30", active=5)],
+        "unitStats": [], "dataShift": "Jantar", "lastSourceDataAt": "2026-09-30T20:00:00",
+        "uploadedAt": "2026-09-30T20:05:00+00:00",
+        "effectiveFrom": "2026-06-30", "effectiveTo": "2026-09-30", "chunks": {},
+    }))
+    payload = _legacy_payload([_net("2026-09-30", active=9)], [_unit("2026-09-30", active=9)])
+    asyncio.run(main_module._publish_chunks_from_payload(payload))
+
+    summary = asyncio.run(main_module.read_summary_payload())
+    by_date = {e["date"]: e for e in summary["networkHistory"]}
+    assert by_date["2026-09-30"]["activeItems"] == 9  # novo venceu
+    assert by_date["2026-08-03"]["activeItems"] == 7  # antigo preservado
+    assert len(summary["networkHistory"]) == 2  # sem duplicar a mesma chave
+    assert [e["active"] for e in summary["unitHistory"]] == [9]
+
+
+def test_publish_chunks_from_payload_preserva_almoco_e_jantar_do_mesmo_dia(monkeypatch, tmp_path):
+    _setup_local_storage(monkeypatch, tmp_path)
+    asyncio.run(main_module.write_summary_payload({
+        "networkHistory": [_net("2026-09-30", shift="Almoço")],
+        "unitHistory": [_unit("2026-09-30", shift="Almoço")],
+        "unitStats": [], "dataShift": "Almoço", "lastSourceDataAt": "2026-09-30T08:37:54",
+        "uploadedAt": "2026-09-30T08:40:00+00:00",
+        "effectiveFrom": "2026-06-30", "effectiveTo": "2026-09-30", "chunks": {},
+    }))
+    payload = _legacy_payload([_net("2026-09-30", shift="Jantar")], [_unit("2026-09-30", shift="Jantar")])
+    asyncio.run(main_module._publish_chunks_from_payload(payload))
+
+    summary = asyncio.run(main_module.read_summary_payload())
+    assert {(e["date"], e["shift"]) for e in summary["networkHistory"]} == {
+        ("2026-09-30", "Almoço"), ("2026-09-30", "Jantar"),
+    }
+    assert len(summary["unitHistory"]) == 2
+
+
+def test_publish_chunks_from_payload_retencao_remove_so_o_que_saiu_da_janela(monkeypatch, tmp_path):
+    _setup_local_storage(monkeypatch, tmp_path)
+    # Summary antigo ainda guarda Junho (fora da janela quando a data real
+    # mais recente avança para 01/10 -> cutoff 01/07) e Julho (dentro).
+    asyncio.run(main_module.write_summary_payload({
+        "networkHistory": [_net("2026-06-20"), _net("2026-06-30"), _net("2026-07-01"), _net("2026-07-02")],
+        "unitHistory": [_unit("2026-06-20"), _unit("2026-07-02")],
+        "unitStats": [], "dataShift": "Jantar", "lastSourceDataAt": "2026-09-30T20:00:00",
+        "uploadedAt": "2026-09-30T20:05:00+00:00",
+        "effectiveFrom": "2026-06-20", "effectiveTo": "2026-09-30", "chunks": {},
+    }))
+    payload = _legacy_payload([_net("2026-10-01")], [_unit("2026-10-01")])
+    asyncio.run(main_module._publish_chunks_from_payload(payload))
+
+    summary = asyncio.run(main_module.read_summary_payload())
+    assert summary["effectiveFrom"] == "2026-07-01"
+    # 20/06 e 30/06 saíram da janela; 01/07 (exatamente o cutoff) e 02/07 ficam.
+    assert sorted(e["date"] for e in summary["networkHistory"]) == ["2026-07-01", "2026-07-02", "2026-10-01"]
+    assert sorted(e["date"] for e in summary["unitHistory"]) == ["2026-07-02", "2026-10-01"]
+    # Nada fabricado: só datas que existiam em alguma das duas fontes.
+    assert all(e["date"] in {"2026-06-20", "2026-06-30", "2026-07-01", "2026-07-02", "2026-10-01"}
+               for e in summary["networkHistory"])
+
+
+def test_sequencia_real_summary_completo_upload_legado_reduzido_e_publicacao_normal(monkeypatch, tmp_path):
+    """summary completo -> POST /api/data/upload com payload legado reduzido
+    -> publish_chunked_snapshot (leitura normal do Postgres, janela curta) ->
+    o summary final continua com TODA a janela histórica."""
+    admin_password = "senha-admin-teste-erosao"
+    monkeypatch.setenv("ADMIN_PASSWORD_HASH", hashlib.sha256(admin_password.encode()).hexdigest())
+    monkeypatch.setenv("SESSION_SECRET", "segredo-de-sessao-com-mais-de-trinta-e-dois-caracteres")
+    _setup_local_storage(monkeypatch, tmp_path)
+
+    asyncio.run(main_module.write_summary_payload({
+        "networkHistory": [_net(d) for d in FULL_DATES],
+        "unitHistory": [_unit(d) for d in FULL_DATES],
+        "unitStats": [], "dataShift": "Jantar", "lastSourceDataAt": "2026-09-30T20:00:00",
+        "uploadedAt": "2026-09-30T20:05:00+00:00",
+        "effectiveFrom": "2026-06-30", "effectiveTo": "2026-09-30", "chunks": {},
+    }))
+
+    reduced = ["2026-09-30", "2026-10-01"]
+    payload = _legacy_payload([_net(d) for d in reduced], [_unit(d) for d in reduced])
+    with TestClient(main_module.app) as client:
+        assert client.post("/api/session", json={"password": admin_password}).status_code == 200
+        upload = client.post(
+            "/api/data/upload", content=gzip.compress(json.dumps(payload).encode("utf-8")),
+            headers={"Content-Type": "application/gzip"},
+        )
+        assert upload.status_code == 200
+        assert upload.json()["chunkPublish"]["effectiveTo"] == "2026-10-01"
+
+    # Passo seguinte do mesmo sync: publish_chunked_snapshot lê o summary que
+    # o upload legado acabou de publicar (via fetch_summary) e mescla só a
+    # janela curta do Postgres (aqui, só 01/10).
+    published: dict = {}
+    monkeypatch.setattr(sync_mod, "fetch_summary", lambda session, base_url: asyncio.run(main_module.read_summary_payload()))
+    monkeypatch.setattr(
+        sync_mod, "fetch_catalog_chunk",
+        lambda session, base_url, period: asyncio.run(main_module.read_catalog_chunk(period)),
+    )
+    monkeypatch.setattr(
+        sync_mod, "upload_catalog_chunk",
+        lambda session, base_url, period, cube: asyncio.run(main_module.write_catalog_chunk(period, cube)) or {"success": True},
+    )
+    monkeypatch.setattr(sync_mod, "upload_summary", lambda session, base_url, summary: published.update(summary))
+
+    flat_rows = [_flat_row("Loja A", "X", "2026-10-01", "Jantar", "Pausado", 15.0)]
+    extra = sync_mod.build_cube_and_history(flat_rows)
+    final = sync_mod.publish_chunked_snapshot(None, "https://example.test", flat_rows, extra, source_data_at="2026-10-01T20:00:00")
+
+    assert {e["date"] for e in final["networkHistory"]} == set(FULL_DATES)
+    assert {e["date"] for e in final["unitHistory"] if e["label"] == "Loja A"} >= set(FULL_DATES)
+    assert {e["date"][:7] for e in final["networkHistory"]} == {"2026-07", "2026-08", "2026-09", "2026-10"}
+    assert final["effectiveFrom"] == "2026-07-01"
+    assert published == final

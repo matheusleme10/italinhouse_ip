@@ -1027,15 +1027,38 @@ async def _publish_chunks_from_payload(payload: dict) -> dict | None:
         await write_catalog_chunk(period, merged_cube)  # propaga CloudStorageError -> aborta antes do summary
         manifest[period] = {"updatedAt": now_iso, "recordCount": len(merged_cube.get("records", []))}
 
-    network_history = metadata.get("networkHistory") or []
-    unit_history = metadata.get("unitHistory") or []
+    # networkHistory/unitHistory: UNIÃO (nunca substituição) entre o que o
+    # summary já publicado tem e o que veio neste payload legado. O payload
+    # legado passa por trim_payload_to_fit (scripts/sync_postgres_pausados.py)
+    # e pode trazer só uma fração do histórico — usá-lo como autoridade
+    # apagava Julho/Agosto já publicados a cada sincronização normal, e o
+    # histórico não conseguia se recuperar sozinho (a leitura normal do
+    # Postgres só cobre POSTGRES_LOOKBACK_DAYS). Dado novo vence em caso de
+    # mesma chave (date|shift e label|date|shift); nada é fabricado.
+    merged_network_history = _merge_history_entries(
+        existing_summary.get("networkHistory"), metadata.get("networkHistory"),
+        lambda e: f"{e.get('date')}|{e.get('shift') or ''}",
+    )
+    merged_unit_history = _merge_history_entries(
+        existing_summary.get("unitHistory"), metadata.get("unitHistory"),
+        lambda e: f"{e.get('label')}|{e.get('date')}|{e.get('shift') or ''}",
+    )
     latest = None
-    for entry in (*network_history, *unit_history):
+    for entry in (*merged_network_history, *merged_unit_history):
         value = entry.get("date")
         if value and (latest is None or value > latest):
             latest = value
     effective_to = latest
     effective_from = catalog_chunks.cutoff_from(latest, catalog_chunks.WINDOW_MONTHS) if latest else None
+
+    # Retenção oficial de WINDOW_MONTHS só DEPOIS da união: datas realmente
+    # fora da janela (relativa à data real mais recente) saem normalmente;
+    # tudo que ainda está dentro dela é preservado.
+    def _within_window(value: str | None) -> bool:
+        return not effective_from or not value or value >= effective_from
+
+    network_history = [e for e in merged_network_history if _within_window(e.get("date"))]
+    unit_history = [e for e in merged_unit_history if _within_window(e.get("date"))]
 
     summary = {
         "networkSummary": metadata.get("networkSummary"),
