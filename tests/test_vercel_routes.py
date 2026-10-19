@@ -36,3 +36,26 @@ def test_vercel_routes_forward_sync_now_and_sync_status_to_python():
     catch_all_index = sources.index("/(.*)")
     assert sources.index("/api/data/sync-now") < catch_all_index
     assert sources.index("/api/data/sync-status") < catch_all_index
+
+
+def test_vercel_routes_forward_price_overrides_and_alert_ignores_to_python():
+    """Mesma classe de bug documentada acima: /api/price-overrides nao tinha
+    entrada propria em vercel.json (achado ao implementar as exclusoes
+    permanentes da Central de Alertas, que reaproveitam exatamente esse
+    padrao de persistencia) — caia no catch-all "/(.*)" -> "/index.html" em
+    producao, mesmo funcionando em dev via proxy do Vite. /api/alert-ignores
+    e sua rota de restauracao ja nascem com entrada explicita para nao
+    repetir o mesmo problema."""
+    root = Path(__file__).resolve().parent.parent
+    config = json.loads((root / "vercel.json").read_text(encoding="utf-8"))
+    routes = {rewrite["source"]: rewrite["destination"] for rewrite in config["rewrites"]}
+
+    assert routes["/api/price-overrides"] == "/api/index"
+    assert routes["/api/alert-ignores"] == "/api/index"
+    assert routes["/api/alert-ignores/(.*)"] == "/api/index"
+
+    sources = [rewrite["source"] for rewrite in config["rewrites"]]
+    catch_all_index = sources.index("/(.*)")
+    assert sources.index("/api/price-overrides") < catch_all_index
+    assert sources.index("/api/alert-ignores") < catch_all_index
+    assert sources.index("/api/alert-ignores/(.*)") < catch_all_index

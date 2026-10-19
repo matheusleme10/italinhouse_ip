@@ -3,7 +3,11 @@ import { C } from '../constants.js';
 import { Card } from '../components/ui/Card.jsx';
 import { Kpi } from '../components/ui/Kpi.jsx';
 import { Ic } from '../components/ui/Icon.jsx';
+import { Pill } from '../components/ui/Pill.jsx';
+import { AlertRow, PriorityCard } from '../components/ui/AlertPriorityCard.jsx';
+import { AlertIgnoreForm } from '../components/ui/AlertIgnoreForm.jsx';
 import { pct, brl, shortName } from '../utils/format.js';
+import { buildAlertCatalogOptions, isAlertIgnored } from '../utils/alert-ignores.js';
 
 const TYPE_FILTERS = [
   ['all', 'Todas'],
@@ -11,60 +15,88 @@ const TYPE_FILTERS = [
   ['item', 'Itens'],
 ];
 
-function AlertRow({ color, bg, border, children }) {
+const selectStyle = {
+  padding: '9px 10px', borderRadius: 9, border: `1px solid ${C.border}`, fontSize: 12, background: '#fff', color: C.text,
+};
+const secondaryBtnStyle = {
+  padding: '8px 14px', borderRadius: 9, border: `1px solid ${C.border}`, background: '#fff',
+  color: C.muted, fontSize: 11, fontWeight: 600, cursor: 'pointer',
+};
+const clearBtnStyle = { ...secondaryBtnStyle, color: C.red };
+const ignoreLinkStyle = {
+  border: 'none', background: 'none', color: C.blue, fontSize: 10, fontWeight: 700, cursor: 'pointer', padding: 0,
+};
+
+// Linha de alerta de item/categoria com o atalho "Ignorar" + badge quando a
+// ocorrência está (ou passaria a estar) oculta por uma regra ativa.
+function IgnorableAlertRow({
+  color, bg, border, type, target, ignored, catalogOptions, onCreateIgnore, children,
+}) {
+  const [open, setOpen] = useState(false);
   return (
-    <div style={{
-      display: 'flex', gap: 10, alignItems: 'flex-start', padding: '11px 13px',
-      background: bg, borderRadius: 10, border: `1px solid ${border}`,
-    }}
-    >
-      <Ic n="alert" s={14} c={color} style={{ marginTop: 1, flexShrink: 0 }} />
-      <div style={{ flex: 1, minWidth: 0, fontSize: 12, color: C.text }}>{children}</div>
+    <div>
+      <AlertRow color={color} bg={bg} border={border} ignored={ignored}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            {children}
+            {ignored && <Pill color={C.purple} bg={C.purpleL} s={9}>Ignorado</Pill>}
+          </div>
+          {onCreateIgnore && !ignored && (
+            <button type="button" style={ignoreLinkStyle} onClick={() => setOpen((v) => !v)}>
+              {open ? 'Cancelar' : 'Ignorar'}
+            </button>
+          )}
+        </div>
+      </AlertRow>
+      {open && (
+        <div style={{ marginTop: 6 }}>
+          <AlertIgnoreForm
+            compact
+            fixedType={type}
+            fixedTarget={target}
+            catalogOptions={catalogOptions}
+            onCreate={onCreateIgnore}
+            onDone={() => setOpen(false)}
+          />
+        </div>
+      )}
     </div>
   );
 }
 
-function AlertGroup({ label, rows }) {
-  if (!rows.length) return null;
-  return (
-    <div style={{ marginBottom: 4 }}>
-      <div style={{
-        fontSize: 10, fontWeight: 700, letterSpacing: '.04em', color: C.muted,
-        textTransform: 'uppercase', margin: '2px 0 8px', paddingTop: 10, borderTop: `1px dashed ${C.border}`,
-      }}
-      >
-        {label} · {rows.length}
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>{rows}</div>
-    </div>
-  );
-}
-
-function PriorityCard({ icon, iconColor, iconBg, title, subtitle, titleColor, groups }) {
-  if (!groups.some((group) => group.rows.length)) return null;
-  return (
-    <Card>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-        <div style={{
-          width: 28, height: 28, borderRadius: 8, background: iconBg,
-          display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-        }}
-        >
-          <Ic n={icon} s={14} c={iconColor} />
-        </div>
-        <div>
-          <div style={{ fontWeight: 700, fontSize: 13, color: titleColor }}>{title}</div>
-          <div style={{ fontSize: 10, color: C.muted }}>{subtitle}</div>
-        </div>
-      </div>
-      {groups.map((group) => <AlertGroup key={group.label} label={group.label} rows={group.rows} />)}
-    </Card>
-  );
-}
-
-export function AlertsPage({ today }) {
+export function AlertsPage({ today, alertIgnores = [], ignoresLoading = false, ignoresError = null, onCreateIgnore }) {
   const [query, setQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState('all');
+  const [categoryFilter, setCategoryFilter] = useState('');
+  const [itemFilter, setItemFilter] = useState('');
+  const [showIgnored, setShowIgnored] = useState(false);
+
+  const catalogOptions = useMemo(() => buildAlertCatalogOptions(today), [today]);
+
+  // Com "Mostrar ignorados" ligado, a agregação roda sem aplicar nenhuma
+  // regra (ninguém é escondido); o que muda é só a exibição/contagem — os
+  // badges "Ignorado" continuam calculados a partir das regras REAIS,
+  // nunca do toggle, então a auditoria é sempre fiel ao que está cadastrado.
+  const effectiveIgnores = showIgnored ? [] : alertIgnores;
+
+  const ignoredItemNames = useMemo(() => {
+    const set = new Set();
+    today.forEach((r) => {
+      if (r.status === 'Pausado' && r.item && isAlertIgnored({ type: 'item', target: r.item, loja: r.loja }, alertIgnores)) {
+        set.add(r.item);
+      }
+    });
+    return set;
+  }, [today, alertIgnores]);
+  const ignoredCategoryNames = useMemo(() => {
+    const set = new Set();
+    today.forEach((r) => {
+      if (r.categoria && isAlertIgnored({ type: 'category', target: r.categoria, loja: r.loja }, alertIgnores)) {
+        set.add(r.categoria);
+      }
+    });
+    return set;
+  }, [today, alertIgnores]);
 
   const data = useMemo(() => {
     const lojaMap = {};
@@ -77,23 +109,33 @@ export function AlertsPage({ today }) {
 
     today.forEach((r) => {
       if (!r.loja) return;
+      // Disponibilidade real por loja: nunca filtrada por exclusões — a regra
+      // de negócio exige que isso continue refletindo o catálogo bruto.
       if (!lojaMap[r.loja]) lojaMap[r.loja] = { t: 0, p: 0, a: 0 };
       lojaMap[r.loja].t += 1;
       if (r.status === 'Pausado') lojaMap[r.loja].p += 1;
       else lojaMap[r.loja].a += 1;
 
-      if (!catMap[r.categoria]) catMap[r.categoria] = { t: 0, p: 0, risco: 0 };
-      catMap[r.categoria].t += 1;
+      const categoryIgnored = isAlertIgnored({ type: 'category', target: r.categoria, loja: r.loja }, effectiveIgnores);
+      if (!categoryIgnored) {
+        if (!catMap[r.categoria]) catMap[r.categoria] = { t: 0, p: 0, risco: 0 };
+        catMap[r.categoria].t += 1;
+      }
 
       if (r.status === 'Pausado' && r.item) {
-        if (!itemMap[r.item]) {
-          itemMap[r.item] = { n: r.item, cat: r.categoria, lojas: new Set(), risco: 0, pausados: 0 };
+        const itemIgnored = isAlertIgnored({ type: 'item', target: r.item, loja: r.loja }, effectiveIgnores);
+        if (!itemIgnored) {
+          if (!itemMap[r.item]) {
+            itemMap[r.item] = { n: r.item, cat: r.categoria, lojas: new Set(), risco: 0, pausados: 0 };
+          }
+          itemMap[r.item].lojas.add(r.loja);
+          itemMap[r.item].risco += Number(r.precoNum) || 0;
+          itemMap[r.item].pausados += 1;
         }
-        itemMap[r.item].lojas.add(r.loja);
-        itemMap[r.item].risco += Number(r.precoNum) || 0;
-        itemMap[r.item].pausados += 1;
-        catMap[r.categoria].p += 1;
-        catMap[r.categoria].risco += Number(r.precoNum) || 0;
+        if (!categoryIgnored) {
+          catMap[r.categoria].p += 1;
+          catMap[r.categoria].risco += Number(r.precoNum) || 0;
+        }
       }
     });
 
@@ -122,24 +164,33 @@ export function AlertsPage({ today }) {
     const belowAvgStores = storeEntries.filter((s) => s.score >= 80 && s.score < networkAvg).sort((a, b) => a.score - b.score);
 
     return { criticoStores, criticoItems, atencaoStores, atencaoItems, atencaoCategories, topRevenueItems, belowAvgStores, networkAvg };
-  }, [today]);
+  }, [today, effectiveIgnores]);
 
+  // Receita total em risco: cálculo de risco já existente, propositalmente
+  // NUNCA filtrado por exclusões (elas afetam só a exibição/contagem dos
+  // alertas de item/categoria, não esse indicador financeiro).
   const totalRisk = useMemo(() => today
     .filter((r) => r.status === 'Pausado' && r.precoNum > 0)
     .reduce((sum, r) => sum + (Number(r.precoNum) || 0), 0), [today]);
 
   const term = query.trim().toLocaleLowerCase('pt-BR');
   const matches = (label) => !term || String(label || '').toLocaleLowerCase('pt-BR').includes(term);
-  const showStores = typeFilter !== 'item';
+  const matchesCategory = (cat) => !categoryFilter || cat === categoryFilter;
+  const matchesItem = (name) => !itemFilter || name === itemFilter;
+  const hasCategoryOrItemFilter = Boolean(categoryFilter || itemFilter);
+  // Alertas de franquia (score por loja) não têm categoria/item associado —
+  // ao filtrar por um dos dois, não há como dizer se eles "pertencem" ao
+  // filtro, então ficam ocultos (igual ao filtro de tipo "Itens").
+  const showStores = typeFilter !== 'item' && !hasCategoryOrItemFilter;
   const showItems = typeFilter !== 'store';
 
   const v = {
     criticoStores: showStores ? data.criticoStores.filter((s) => matches(s.loja)) : [],
-    criticoItems: showItems ? data.criticoItems.filter((i) => matches(i.n)) : [],
+    criticoItems: showItems ? data.criticoItems.filter((i) => matches(i.n) && matchesCategory(i.cat) && matchesItem(i.n)) : [],
     atencaoStores: showStores ? data.atencaoStores.filter((s) => matches(s.loja)) : [],
-    atencaoItems: showItems ? data.atencaoItems.filter((i) => matches(i.n)) : [],
-    atencaoCategories: showItems ? data.atencaoCategories.filter((c) => matches(c.cat)) : [],
-    topRevenueItems: showItems ? data.topRevenueItems.filter((i) => matches(i.n)) : [],
+    atencaoItems: showItems ? data.atencaoItems.filter((i) => matches(i.n) && matchesCategory(i.cat) && matchesItem(i.n)) : [],
+    atencaoCategories: showItems ? data.atencaoCategories.filter((c) => matches(c.cat) && matchesCategory(c.cat) && !itemFilter) : [],
+    topRevenueItems: showItems ? data.topRevenueItems.filter((i) => matches(i.n) && matchesCategory(i.cat) && matchesItem(i.n)) : [],
     belowAvgStores: showStores ? data.belowAvgStores.filter((s) => matches(s.loja)) : [],
   };
 
@@ -148,8 +199,22 @@ export function AlertsPage({ today }) {
   const totalMonitor = v.topRevenueItems.length + v.belowAvgStores.length;
   const totalAlerts = totalCritico + totalAtencao + totalMonitor;
 
+  function clearCategoryItemFilters() {
+    setCategoryFilter('');
+    setItemFilter('');
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+      {ignoresError && (
+        <Card style={{ borderLeft: `4px solid ${C.red}`, background: C.redL }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: C.red }}>
+            Não foi possível carregar as exclusões cadastradas. Itens/categorias que deveriam estar ocultos podem
+            estar aparecendo nesta tela até isso ser resolvido.
+          </div>
+        </Card>
+      )}
+
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: 12 }}>
         <Kpi label="Total de Alertas Ativos" value={totalAlerts} icon="alert"
           accent={totalAlerts > 0 ? C.red : C.green} accentBg={totalAlerts > 0 ? C.redL : C.greenL} />
@@ -175,6 +240,20 @@ export function AlertsPage({ today }) {
               border: `1px solid ${C.border}`, fontSize: 12,
             }}
           />
+          <select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)} style={selectStyle}>
+            <option value="">Todas as categorias</option>
+            {catalogOptions.categories.map((cat) => <option key={cat} value={cat}>{cat}</option>)}
+          </select>
+          <input
+            list="alerts-item-filter-options"
+            value={itemFilter}
+            onChange={(event) => setItemFilter(event.target.value)}
+            placeholder="Item específico..."
+            style={{ ...selectStyle, minWidth: 180 }}
+          />
+          <datalist id="alerts-item-filter-options">
+            {catalogOptions.items.map((item) => <option key={item} value={item} />)}
+          </datalist>
           <div style={{ display: 'flex', gap: 6 }}>
             {TYPE_FILTERS.map(([value, label]) => (
               <button
@@ -193,6 +272,15 @@ export function AlertsPage({ today }) {
               </button>
             ))}
           </div>
+          {hasCategoryOrItemFilter && (
+            <button type="button" onClick={clearCategoryItemFilters} style={clearBtnStyle}>
+              Limpar filtros de categoria/item
+            </button>
+          )}
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: C.muted, fontWeight: 600 }}>
+            <input type="checkbox" checked={showIgnored} onChange={(event) => setShowIgnored(event.target.checked)} />
+            Mostrar ignorados
+          </label>
         </div>
       </Card>
 
@@ -211,9 +299,12 @@ export function AlertsPage({ today }) {
           {
             label: 'Itens sistêmicos',
             rows: v.criticoItems.map((i) => (
-              <AlertRow key={`item-${i.n}`} color={C.red} bg={C.redL} border={C.redM}>
+              <IgnorableAlertRow key={`item-${i.n}`} color={C.red} bg={C.redL} border={C.redM}
+                type="item" target={i.n} ignored={ignoredItemNames.has(i.n)}
+                catalogOptions={catalogOptions} onCreateIgnore={onCreateIgnore}
+              >
                 Item sistêmico: <strong>{i.n}</strong> pausado em {i.lojas.size} franquias — risco {brl(i.risco)}
-              </AlertRow>
+              </IgnorableAlertRow>
             )),
           },
         ]}
@@ -234,17 +325,23 @@ export function AlertsPage({ today }) {
           {
             label: 'Itens',
             rows: v.atencaoItems.map((i) => (
-              <AlertRow key={`item-${i.n}`} color={C.amber} bg={C.amberL} border={C.amberM}>
+              <IgnorableAlertRow key={`item-${i.n}`} color={C.amber} bg={C.amberL} border={C.amberM}
+                type="item" target={i.n} ignored={ignoredItemNames.has(i.n)}
+                catalogOptions={catalogOptions} onCreateIgnore={onCreateIgnore}
+              >
                 Item <strong>{i.n}</strong> pausado em 2 franquias
-              </AlertRow>
+              </IgnorableAlertRow>
             )),
           },
           {
             label: 'Categorias',
             rows: v.atencaoCategories.map((c) => (
-              <AlertRow key={`cat-${c.cat}`} color={C.amber} bg={C.amberL} border={C.amberM}>
+              <IgnorableAlertRow key={`cat-${c.cat}`} color={C.amber} bg={C.amberL} border={C.amberM}
+                type="category" target={c.cat} ignored={ignoredCategoryNames.has(c.cat)}
+                catalogOptions={catalogOptions} onCreateIgnore={onCreateIgnore}
+              >
                 Categoria <strong>{c.cat || 'Sem categoria'}</strong> com {c.percent}% dos itens pausados
-              </AlertRow>
+              </IgnorableAlertRow>
             )),
           },
         ]}
@@ -257,9 +354,12 @@ export function AlertsPage({ today }) {
           {
             label: 'Maior receita pausada',
             rows: v.topRevenueItems.map((i) => (
-              <AlertRow key={`rev-${i.n}`} color={C.blue} bg={C.blueL} border={C.blueM}>
+              <IgnorableAlertRow key={`rev-${i.n}`} color={C.blue} bg={C.blueL} border={C.blueM}
+                type="item" target={i.n} ignored={ignoredItemNames.has(i.n)}
+                catalogOptions={catalogOptions} onCreateIgnore={onCreateIgnore}
+              >
                 Item <strong>{i.n}</strong> — receita pausada: {brl(i.risco)}
-              </AlertRow>
+              </IgnorableAlertRow>
             )),
           },
           {
@@ -278,7 +378,7 @@ export function AlertsPage({ today }) {
           <Ic n="check" s={48} c={C.green} />
           <div style={{ marginTop: 14, fontWeight: 600, fontSize: 15 }}>✓ Nenhum alerta ativo</div>
           <div style={{ fontSize: 13, marginTop: 6, color: C.muted }}>
-            {query || typeFilter !== 'all'
+            {query || typeFilter !== 'all' || hasCategoryOrItemFilter
               ? 'Nenhum alerta corresponde ao filtro atual.'
               : 'Sua rede está funcionando dentro dos parâmetros esperados.'}
           </div>
@@ -314,6 +414,10 @@ export function AlertsPage({ today }) {
             ))}
           </div>
         </Card>
+      )}
+
+      {ignoresLoading && (
+        <div style={{ fontSize: 11, color: C.muted, textAlign: 'center' }}>Carregando exclusões cadastradas...</div>
       )}
     </div>
   );

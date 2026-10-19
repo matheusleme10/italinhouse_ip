@@ -12,10 +12,13 @@ import base64
 import time
 import asyncio
 import smtplib
+import unicodedata
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -54,6 +57,16 @@ FEEDBACK_SETTINGS_PATH = DATA_DIR / "feedback-settings.json"
 FEEDBACK_SETTINGS_BLOB_PATH = "ital-dashboard/feedback-settings.json"
 PRICE_OVERRIDES_PATH = DATA_DIR / "price-overrides.json"
 PRICE_OVERRIDES_BLOB_PATH = "ital-dashboard/price-overrides.json"
+# Exclusoes permanentes de categoria/item na Central de Alertas (admin) — ver
+# POST/GET /api/alert-ignores. Mesmo padrao de arquivo+Blob de
+# PRICE_OVERRIDES acima; nunca mexe em catalogRows/detailRows/productRows,
+# so filtra o que a tela de alertas agrega e exibe (ver src/utils/alert-ignores.js).
+ALERT_IGNORES_PATH = DATA_DIR / "alert-ignores.json"
+ALERT_IGNORES_BLOB_PATH = "ital-dashboard/alert-ignores.json"
+# Taxonomia fixa de marcas da rede (mesma de src/utils/brands.js — BRANDS).
+# Nao e a "lista fixa" que o filtro de unidade deve evitar: aqui e so a
+# validacao de que o brandId enviado pelo admin existe de fato.
+VALID_BRAND_IDS = {"ital", "caipira", "city", "green"}
 load_dotenv(ROOT / ".env")
 load_dotenv(ROOT / ".env.local", override=True)
 
@@ -222,6 +235,49 @@ class PriceOverrideRequest(BaseModel):
     item: str = Field(min_length=1, max_length=300)
     categoria: str = ""
     price: float = Field(gt=0, le=100000)
+
+
+class AlertIgnoreRequest(BaseModel):
+    type: Literal["category", "item"]
+    target: str = Field(min_length=1, max_length=300)
+    scope: Literal["network", "brand", "store"]
+    brandId: str | None = None
+    storeKey: str | None = None
+    storeLabel: str | None = None
+
+
+def _normalized_store_name(value: str) -> str:
+    text = unicodedata.normalize("NFD", str(value or ""))
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _frontend_store_key(value: str) -> str:
+    """Porta em Python de storeKey (src/utils/stores.js) — usada so para
+    comparar, no backend, a unidade da franquia logada (cookie de contexto)
+    contra o storeKey gravado numa regra de escopo 'store' (que foi
+    calculado no frontend na hora de criar a regra). Se a logica de
+    storeKey mudar la, precisa mudar aqui tambem."""
+    text = str(value or "").strip()
+    match = re.search(r"(?:^|\D)(\d{5,})\s*$", text)
+    if match:
+        return f"id:{match.group(1)}"
+    return f"name:{_normalized_store_name(text)}"
+
+
+def _identify_brand(store_name: str) -> str:
+    """Porta em Python de identifyBrand (src/utils/brands.js) — usada so para
+    validar, no backend, que a unidade informada numa exclusao de escopo
+    'store' realmente pertence a marca selecionada. Se a heuristica mudar
+    la, precisa mudar aqui tambem."""
+    name = (store_name or "").lower()
+    if "city" in name or "burger" in name:
+        return "city"
+    if "green" in name or "salad" in name or "salada" in name:
+        return "green"
+    if "caipira" in name or "boiadeir" in name:
+        return "caipira"
+    return "ital"
 
 
 def client() -> IFoodClient:
@@ -1398,6 +1454,54 @@ async def write_price_overrides(overrides: dict) -> None:
     temporary.replace(PRICE_OVERRIDES_PATH)
 
 
+def _normalize_alert_target(value: str) -> str:
+    return " ".join(str(value or "").strip().split()).lower()
+
+
+async def read_alert_ignores() -> dict:
+    """Exclusoes permanentes de categoria/item na Central de Alertas. Nunca
+    toca nos dados de catalogo/preco/status — so guarda as regras que a
+    AlertsPage usa para filtrar o que ela mesma agrega e exibe."""
+    if BLOB_TOKEN:
+        from vercel.blob import AsyncBlobClient, BlobNotFoundError
+
+        try:
+            async with AsyncBlobClient(token=BLOB_TOKEN) as blob_client:
+                result = await blob_client.get(ALERT_IGNORES_BLOB_PATH, access="private")
+                raw = await _blob_result_bytes(result)
+                if raw is None:
+                    return {}
+        except BlobNotFoundError:
+            return {}
+        return json.loads(raw.decode("utf-8"))
+
+    if not ALERT_IGNORES_PATH.is_file():
+        return {}
+    return json.loads(ALERT_IGNORES_PATH.read_text(encoding="utf-8"))
+
+
+async def write_alert_ignores(rules: dict) -> None:
+    serialized = json.dumps(rules, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if BLOB_TOKEN:
+        from vercel.blob import AsyncBlobClient
+
+        async with AsyncBlobClient(token=BLOB_TOKEN) as blob_client:
+            await blob_client.put(
+                ALERT_IGNORES_BLOB_PATH,
+                serialized,
+                access="private",
+                content_type="application/json",
+                overwrite=True,
+                cache_control_max_age=0,
+            )
+        return
+
+    DATA_DIR.mkdir(exist_ok=True)
+    temporary = DATA_DIR / "alert-ignores.next.json"
+    temporary.write_bytes(serialized)
+    temporary.replace(ALERT_IGNORES_PATH)
+
+
 def _notification_context(payload: dict, settings: dict | None = None) -> dict[str, str]:
     rows = payload.get("rows") or []
     metadata = next((row for row in rows if row.get("networkHistory") or row.get("networkSummary")), {})
@@ -1735,6 +1839,112 @@ async def set_price_override(action: PriceOverrideRequest, request: Request) -> 
     }
     await write_price_overrides(overrides)
     return {"success": True, "key": key, "override": overrides[key]}
+
+
+@app.get("/api/alert-ignores")
+async def get_alert_ignores(request: Request) -> dict:
+    # Leitura: admin ve tudo; franquia ve so o que se aplica ao proprio
+    # contexto (rede inteira + a marca/unidade dela) — mesmo raciocinio de
+    # escopo que /api/price-overrides ja aplica, pra nao revelar regras de
+    # outras marcas/unidades. Escrita (criar/restaurar) continua admin-only.
+    role = require_session(request)
+    rules = await read_alert_ignores()
+    values = list(rules.values())
+    if role == "franchise":
+        context = _get_franchise_context(request)
+        if context is None:
+            return {"rules": []}
+        brand_id = context.get("brandId")
+        store_key_value = _frontend_store_key(context.get("store"))
+        values = [
+            rule for rule in values
+            if rule.get("scope") == "network"
+            or (rule.get("scope") == "brand" and rule.get("brandId") == brand_id)
+            or (rule.get("scope") == "store" and rule.get("storeKey") == store_key_value)
+        ]
+    return {"rules": values}
+
+
+@app.post("/api/alert-ignores")
+async def create_alert_ignore(action: AlertIgnoreRequest, request: Request) -> dict:
+    if require_session(request) != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores podem criar exclusões.")
+
+    target = " ".join(action.target.strip().split())
+    if not target:
+        raise HTTPException(status_code=400, detail="Informe a categoria ou o item.")
+    target_key = _normalize_alert_target(target)
+
+    brand_id: str | None = None
+    store_key: str | None = None
+    store_label: str | None = None
+
+    if action.scope == "network":
+        if action.brandId or action.storeKey:
+            raise HTTPException(status_code=400, detail="Exclusão de rede não aceita marca ou unidade.")
+    elif action.scope == "brand":
+        if not action.brandId or action.brandId not in VALID_BRAND_IDS:
+            raise HTTPException(status_code=400, detail="Informe uma marca válida.")
+        if action.storeKey:
+            raise HTTPException(status_code=400, detail="Exclusão de marca não aceita unidade específica.")
+        brand_id = action.brandId
+    else:  # scope == "store"
+        if not action.brandId or action.brandId not in VALID_BRAND_IDS:
+            raise HTTPException(status_code=400, detail="Informe uma marca válida.")
+        cleaned_label = " ".join((action.storeLabel or "").strip().split())
+        if not action.storeKey or not cleaned_label:
+            raise HTTPException(status_code=400, detail="Informe a unidade.")
+        if _identify_brand(cleaned_label) != action.brandId:
+            raise HTTPException(status_code=400, detail="A unidade informada não pertence à marca selecionada.")
+        brand_id, store_key, store_label = action.brandId, action.storeKey, cleaned_label
+
+    rules = await read_alert_ignores()
+    duplicate = any(
+        rule.get("status") == "active"
+        and rule.get("type") == action.type
+        and rule.get("targetKey") == target_key
+        and rule.get("scope") == action.scope
+        and rule.get("brandId") == brand_id
+        and rule.get("storeKey") == store_key
+        for rule in rules.values()
+    )
+    if duplicate:
+        raise HTTPException(status_code=409, detail="Já existe uma exclusão ativa com os mesmos critérios.")
+
+    rule_id = uuid.uuid4().hex
+    rules[rule_id] = {
+        "id": rule_id,
+        "type": action.type,
+        "target": target,
+        "targetKey": target_key,
+        "scope": action.scope,
+        "brandId": brand_id,
+        "storeKey": store_key,
+        "storeLabel": store_label,
+        "status": "active",
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+        "createdBy": "admin",
+        "restoredAt": None,
+        "restoredBy": None,
+    }
+    await write_alert_ignores(rules)
+    return {"success": True, "rule": rules[rule_id]}
+
+
+@app.post("/api/alert-ignores/{rule_id}/restore")
+async def restore_alert_ignore(rule_id: str, request: Request) -> dict:
+    if require_session(request) != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores podem restaurar exclusões.")
+    rules = await read_alert_ignores()
+    rule = rules.get(rule_id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="Exclusão não encontrada.")
+    if rule.get("status") == "active":
+        rule["status"] = "restored"
+        rule["restoredAt"] = datetime.now(timezone.utc).isoformat()
+        rule["restoredBy"] = "admin"
+        await write_alert_ignores(rules)
+    return {"success": True, "rule": rule}
 
 
 @app.get("/api/feedback/settings")

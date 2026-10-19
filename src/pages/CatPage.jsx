@@ -6,7 +6,9 @@ import { Pill } from '../components/ui/Pill.jsx';
 import { Ic } from '../components/ui/Icon.jsx';
 import { HBar } from '../components/ui/charts/HBar.jsx';
 import { Donut } from '../components/ui/charts/Donut.jsx';
+import { AlertIgnoreForm } from '../components/ui/AlertIgnoreForm.jsx';
 import { pct, brl, shortName } from '../utils/format.js';
+import { buildAlertCatalogOptions, isAlertIgnored } from '../utils/alert-ignores.js';
 
 function Empty() {
   return (
@@ -29,14 +31,27 @@ const CAT_FILTERS = [
   ['zero-paused', '100% ativo'],
 ];
 
-export function CatPage({ today, showFinancials = false }) {
+export function CatPage({
+  today, showFinancials = false, canManageIgnores = false,
+  alertIgnores = [], ignoresLoading = false, ignoresError = null, onCreateIgnore,
+}) {
   const [sel, setSel] = useState(null);
   const [query, setQuery] = useState('');
   const [catFilter, setCatFilter] = useState('all');
+  const [showIgnored, setShowIgnored] = useState(false);
+  const [ignoringCat, setIgnoringCat] = useState(null);
 
+  const catalogOptions = useMemo(() => buildAlertCatalogOptions(today), [today]);
+  const effectiveIgnores = showIgnored ? [] : alertIgnores;
+
+  // Uma categoria só fica totalmente oculta (linha some da lista) quando a
+  // exclusão cobre TODAS as ocorrências dela no recorte atual — uma regra
+  // de unidade nunca esconde a categoria inteira da rede, só as ocorrências
+  // daquela unidade (ver isAlertIgnored, que resolve por loja/marca).
   const cats = useMemo(() => {
     const map = {};
     today.forEach((r) => {
+      if (isAlertIgnored({ type: 'category', target: r.categoria, loja: r.loja }, effectiveIgnores)) return;
       if (!map[r.categoria])
         map[r.categoria] = {
           cat: r.categoria,
@@ -57,7 +72,17 @@ export function CatPage({ today, showFinancials = false }) {
     return Object.values(map)
       .map((m) => ({ ...m, score: pct(m.a, m.t) }))
       .sort((a, b) => b.p - a.p);
-  }, [today]);
+  }, [today, effectiveIgnores]);
+
+  const ignoredCategoryNames = useMemo(() => {
+    const set = new Set();
+    today.forEach((r) => {
+      if (r.categoria && isAlertIgnored({ type: 'category', target: r.categoria, loja: r.loja }, alertIgnores)) {
+        set.add(r.categoria);
+      }
+    });
+    return set;
+  }, [today, alertIgnores]);
 
   const visibleCats = useMemo(() => {
     const term = query.trim().toLocaleLowerCase('pt-BR');
@@ -143,7 +168,16 @@ export function CatPage({ today, showFinancials = false }) {
               <button type="button" key={value} className={catFilter === value ? 'active' : ''} onClick={() => setCatFilter(value)}>{label}</button>
             ))}
           </div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: C.muted, fontWeight: 600 }}>
+            <input type="checkbox" checked={showIgnored} onChange={(event) => setShowIgnored(event.target.checked)} />
+            Mostrar ignoradas
+          </label>
         </div>
+        {ignoresError && (
+          <div style={{ padding: '9px 12px', borderRadius: 9, background: C.redL, color: C.red, fontSize: 11, fontWeight: 600, marginBottom: 10 }}>
+            Não foi possível carregar as exclusões cadastradas — categorias que deveriam estar ocultas podem estar aparecendo.
+          </div>
+        )}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
           {visibleCats.map((c) => {
             const on = sel?.cat === c.cat;
@@ -188,8 +222,35 @@ export function CatPage({ today, showFinancials = false }) {
                     >
                       {sc}% ativos
                     </Pill>
+                    {ignoredCategoryNames.has(c.cat) && (
+                      <Pill color={on ? 'white' : C.purple} bg={on ? 'rgba(255,255,255,.2)' : C.purpleL} s={10}>Ignorada</Pill>
+                    )}
+                    {canManageIgnores && !ignoredCategoryNames.has(c.cat) && (
+                      <button
+                        type="button"
+                        onClick={(event) => { event.stopPropagation(); setIgnoringCat(ignoringCat === c.cat ? null : c.cat); }}
+                        style={{
+                          border: 'none', background: 'none', cursor: 'pointer', padding: '2px 4px',
+                          color: on ? 'white' : C.blue, fontSize: 10, fontWeight: 700,
+                        }}
+                      >
+                        {ignoringCat === c.cat ? 'Cancelar' : 'Ignorar'}
+                      </button>
+                    )}
                   </div>
                 </div>
+                {ignoringCat === c.cat && (
+                  <div style={{ marginTop: 6 }}>
+                    <AlertIgnoreForm
+                      compact
+                      fixedType="category"
+                      fixedTarget={c.cat}
+                      catalogOptions={catalogOptions}
+                      onCreate={onCreateIgnore}
+                      onDone={() => setIgnoringCat(null)}
+                    />
+                  </div>
+                )}
                 {on && (
                   <div
                     style={{

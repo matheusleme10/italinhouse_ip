@@ -3,61 +3,16 @@ import { C } from '../constants.js';
 import { Card } from '../components/ui/Card.jsx';
 import { Kpi } from '../components/ui/Kpi.jsx';
 import { Ic } from '../components/ui/Icon.jsx';
+import { Pill } from '../components/ui/Pill.jsx';
+import { AlertRow, PriorityCard } from '../components/ui/AlertPriorityCard.jsx';
 import { pct, brl } from '../utils/format.js';
+import { isAlertIgnored } from '../utils/alert-ignores.js';
 
-function AlertRow({ color, bg, border, children }) {
-  return (
-    <div style={{
-      display: 'flex', gap: 10, alignItems: 'flex-start', padding: '11px 13px',
-      background: bg, borderRadius: 10, border: `1px solid ${border}`,
-    }}
-    >
-      <Ic n="alert" s={14} c={color} style={{ marginTop: 1, flexShrink: 0 }} />
-      <div style={{ flex: 1, minWidth: 0, fontSize: 12, color: C.text }}>{children}</div>
-    </div>
-  );
-}
-
-function AlertGroup({ label, rows }) {
-  if (!rows.length) return null;
-  return (
-    <div style={{ marginBottom: 4 }}>
-      <div style={{
-        fontSize: 10, fontWeight: 700, letterSpacing: '.04em', color: C.muted,
-        textTransform: 'uppercase', margin: '2px 0 8px', paddingTop: 10, borderTop: `1px dashed ${C.border}`,
-      }}
-      >
-        {label} · {rows.length}
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>{rows}</div>
-    </div>
-  );
-}
-
-function PriorityCard({ icon, iconColor, iconBg, title, subtitle, titleColor, groups }) {
-  if (!groups.some((group) => group.rows.length)) return null;
-  return (
-    <Card>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-        <div style={{
-          width: 28, height: 28, borderRadius: 8, background: iconBg,
-          display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-        }}
-        >
-          <Ic n={icon} s={14} c={iconColor} />
-        </div>
-        <div>
-          <div style={{ fontWeight: 700, fontSize: 13, color: titleColor }}>{title}</div>
-          <div style={{ fontSize: 10, color: C.muted }}>{subtitle}</div>
-        </div>
-      </div>
-      {groups.map((group) => <AlertGroup key={group.label} label={group.label} rows={group.rows} />)}
-    </Card>
-  );
-}
-
-export function FranchiseAlertsPage({ all }) {
+export function FranchiseAlertsPage({ all, alertIgnores = [], ignoresLoading = false, ignoresError = null }) {
   const [query, setQuery] = useState('');
+  const [showIgnored, setShowIgnored] = useState(false);
+
+  const effectiveIgnores = showIgnored ? [] : alertIgnores;
 
   // Importante: `all` traz as linhas reais item a item (com status/preço).
   // O prop `today` que outras páginas recebem por aqui é um resumo por loja
@@ -72,6 +27,7 @@ export function FranchiseAlertsPage({ all }) {
     const byItem = new Map();
     all.forEach((row) => {
       if (!row.item || !row.dia) return;
+      if (isAlertIgnored({ type: 'item', target: row.item, loja: row.loja }, effectiveIgnores)) return;
       const key = `${row.item}|${row.categoria || ''}`;
       const entry = byItem.get(key) || { name: row.item, category: row.categoria, byDate: new Map() };
       const cell = entry.byDate.get(row.dia) || { paused: false, price: 0 };
@@ -101,6 +57,7 @@ export function FranchiseAlertsPage({ all }) {
     const catMap = {};
     todayRows.forEach((row) => {
       if (!row.categoria) return;
+      if (isAlertIgnored({ type: 'category', target: row.categoria, loja: row.loja }, effectiveIgnores)) return;
       if (!catMap[row.categoria]) catMap[row.categoria] = { t: 0, p: 0, risco: 0 };
       catMap[row.categoria].t += 1;
       if (row.status === 'Pausado') { catMap[row.categoria].p += 1; catMap[row.categoria].risco += Number(row.precoNum) || 0; }
@@ -115,7 +72,22 @@ export function FranchiseAlertsPage({ all }) {
     const totalRisk = todayRows.filter((row) => row.status === 'Pausado' && row.precoNum > 0).reduce((sum, row) => sum + row.precoNum, 0);
 
     return { critico, atencao, recente, atencaoCategories, dates, total, pausedTotal, totalRisk };
-  }, [all]);
+  }, [all, effectiveIgnores]);
+
+  const ignoredItemNames = useMemo(() => {
+    const set = new Set();
+    all.forEach((row) => {
+      if (row.item && isAlertIgnored({ type: 'item', target: row.item, loja: row.loja }, alertIgnores)) set.add(row.item);
+    });
+    return set;
+  }, [all, alertIgnores]);
+  const ignoredCategoryNames = useMemo(() => {
+    const set = new Set();
+    all.forEach((row) => {
+      if (row.categoria && isAlertIgnored({ type: 'category', target: row.categoria, loja: row.loja }, alertIgnores)) set.add(row.categoria);
+    });
+    return set;
+  }, [all, alertIgnores]);
 
   const disponib = pct(data.total - data.pausedTotal, data.total);
   const longPausedCount = data.critico.length;
@@ -141,6 +113,15 @@ export function FranchiseAlertsPage({ all }) {
         </div>
       </div>
 
+      {ignoresError && (
+        <Card style={{ borderLeft: `4px solid ${C.red}`, background: C.redL }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: C.red }}>
+            Não foi possível carregar as exclusões cadastradas pela rede. Itens/categorias que deveriam estar
+            ocultos podem estar aparecendo nesta tela até isso ser resolvido.
+          </div>
+        </Card>
+      )}
+
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: 12 }}>
         <Kpi label="Disponibilidade Atual" value={`${disponib}%`} icon="check"
           accent={disponib >= 80 ? C.green : disponib >= 60 ? C.amber : C.red}
@@ -151,13 +132,19 @@ export function FranchiseAlertsPage({ all }) {
       </div>
 
       <Card>
-        <input
-          type="search"
-          value={query}
-          placeholder="Buscar item ou categoria..."
-          onChange={(event) => setQuery(event.target.value)}
-          style={{ width: '100%', padding: '9px 12px', borderRadius: 9, border: `1px solid ${C.border}`, fontSize: 12 }}
-        />
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+          <input
+            type="search"
+            value={query}
+            placeholder="Buscar item ou categoria..."
+            onChange={(event) => setQuery(event.target.value)}
+            style={{ flex: '1 1 220px', padding: '9px 12px', borderRadius: 9, border: `1px solid ${C.border}`, fontSize: 12 }}
+          />
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: C.muted, fontWeight: 600 }}>
+            <input type="checkbox" checked={showIgnored} onChange={(event) => setShowIgnored(event.target.checked)} />
+            Mostrar ignorados
+          </label>
+        </div>
       </Card>
 
       <PriorityCard
@@ -166,9 +153,10 @@ export function FranchiseAlertsPage({ all }) {
         groups={[{
           label: 'Itens',
           rows: v.critico.map((item) => (
-            <AlertRow key={item.name} color={C.red} bg={C.redL} border={C.redM}>
+            <AlertRow key={item.name} color={C.red} bg={C.redL} border={C.redM} ignored={ignoredItemNames.has(item.name)}>
               <strong>{item.name}</strong> está pausado há <strong>{item.streak} dias consecutivos</strong>
               {item.price > 0 ? ` — preço cadastrado ${brl(item.price)}` : ''}. Confira estoque e cadastro no cardápio.
+              {ignoredItemNames.has(item.name) && <> <Pill color={C.purple} bg={C.purpleL} s={9}>Ignorado</Pill></>}
             </AlertRow>
           )),
         }]}
@@ -181,16 +169,18 @@ export function FranchiseAlertsPage({ all }) {
           {
             label: 'Itens pausados há 2 dias',
             rows: v.atencao.map((item) => (
-              <AlertRow key={item.name} color={C.amber} bg={C.amberL} border={C.amberM}>
+              <AlertRow key={item.name} color={C.amber} bg={C.amberL} border={C.amberM} ignored={ignoredItemNames.has(item.name)}>
                 <strong>{item.name}</strong> está pausado há 2 dias seguidos. Se não for reativado hoje, vira alerta crítico amanhã.
+                {ignoredItemNames.has(item.name) && <> <Pill color={C.purple} bg={C.purpleL} s={9}>Ignorado</Pill></>}
               </AlertRow>
             )),
           },
           {
             label: 'Categorias com mais da metade pausada',
             rows: v.atencaoCategories.map((cat) => (
-              <AlertRow key={cat.cat} color={C.amber} bg={C.amberL} border={C.amberM}>
+              <AlertRow key={cat.cat} color={C.amber} bg={C.amberL} border={C.amberM} ignored={ignoredCategoryNames.has(cat.cat)}>
                 Categoria <strong>{cat.cat}</strong> está com <strong>{cat.percent}%</strong> dos itens pausados hoje.
+                {ignoredCategoryNames.has(cat.cat) && <> <Pill color={C.purple} bg={C.purpleL} s={9}>Ignorado</Pill></>}
               </AlertRow>
             )),
           },
@@ -203,8 +193,9 @@ export function FranchiseAlertsPage({ all }) {
         groups={[{
           label: 'Itens pausados hoje',
           rows: v.recente.map((item) => (
-            <AlertRow key={item.name} color={C.blue} bg={C.blueL} border={C.blueM}>
+            <AlertRow key={item.name} color={C.blue} bg={C.blueL} border={C.blueM} ignored={ignoredItemNames.has(item.name)}>
               <strong>{item.name}</strong> pausou hoje pela primeira vez neste período.
+              {ignoredItemNames.has(item.name) && <> <Pill color={C.purple} bg={C.purpleL} s={9}>Ignorado</Pill></>}
             </AlertRow>
           )),
         }]}
@@ -249,6 +240,10 @@ export function FranchiseAlertsPage({ all }) {
             ))}
           </div>
         </Card>
+      )}
+
+      {ignoresLoading && (
+        <div style={{ fontSize: 11, color: C.muted, textAlign: 'center' }}>Carregando exclusões cadastradas...</div>
       )}
     </div>
   );

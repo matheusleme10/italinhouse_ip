@@ -20,6 +20,9 @@
     { "source": "/api/data/sync-now",   "destination": "/api/index" },
     { "source": "/api/data/sync-status", "destination": "/api/index" },
     { "source": "/api/data",        "destination": "/api/index" },
+    { "source": "/api/price-overrides", "destination": "/api/index" },
+    { "source": "/api/alert-ignores", "destination": "/api/index" },
+    { "source": "/api/alert-ignores/(.*)", "destination": "/api/index" },
     { "source": "/(.*)",     "destination": "/index.html" }
   ]
 }

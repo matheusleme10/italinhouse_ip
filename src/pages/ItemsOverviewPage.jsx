@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { Fragment, useMemo, useState } from 'react';
 import { C } from '../constants.js';
 import { Card } from '../components/ui/Card.jsx';
 import { Kpi } from '../components/ui/Kpi.jsx';
@@ -6,6 +6,8 @@ import { Pill } from '../components/ui/Pill.jsx';
 import { brl } from '../utils/format.js';
 import { DailyItemsMatrix } from '../components/ui/DailyItemsMatrix.jsx';
 import { PriceAdjustTable } from '../components/ui/PriceAdjustTable.jsx';
+import { AlertIgnoreForm } from '../components/ui/AlertIgnoreForm.jsx';
+import { buildAlertCatalogOptions, isAlertIgnored } from '../utils/alert-ignores.js';
 
 const PAGE_SIZE = 10;
 
@@ -13,7 +15,10 @@ const normalize = (value) => String(value || '')
   .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
   .toLocaleLowerCase('pt-BR');
 
-export function ItemsOverviewPage({ rows, onSetDraft, onSavePrice }) {
+export function ItemsOverviewPage({
+  rows, onSetDraft, onSavePrice,
+  alertIgnores = [], ignoresLoading = false, ignoresError = null, onCreateIgnore,
+}) {
   const [query, setQuery] = useState('');
   const [storeQuery, setStoreQuery] = useState('');
   const [storeOpen, setStoreOpen] = useState(false);
@@ -21,6 +26,18 @@ export function ItemsOverviewPage({ rows, onSetDraft, onSavePrice }) {
   const [sortCol, setSortCol] = useState('paused');
   const [sortDir, setSortDir] = useState('desc');
   const [page, setPage] = useState(0);
+  const [showIgnored, setShowIgnored] = useState(false);
+  const [ignoringItem, setIgnoringItem] = useState(null);
+
+  const catalogOptions = useMemo(() => buildAlertCatalogOptions(rows), [rows]);
+  const effectiveIgnores = showIgnored ? [] : alertIgnores;
+  const ignoredItemNames = useMemo(() => {
+    const set = new Set();
+    rows.forEach((row) => {
+      if (row.item && isAlertIgnored({ type: 'item', target: row.item, loja: row.loja }, alertIgnores)) set.add(row.item);
+    });
+    return set;
+  }, [rows, alertIgnores]);
 
   const stores = useMemo(() => [...new Set(rows.map((row) => row.loja).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'pt-BR')), [rows]);
   const scopedRows = useMemo(() => {
@@ -37,6 +54,7 @@ export function ItemsOverviewPage({ rows, onSetDraft, onSavePrice }) {
     const map = new Map();
     scopedRows.forEach((row) => {
       if (!row.item) return;
+      if (isAlertIgnored({ type: 'item', target: row.item, loja: row.loja }, effectiveIgnores)) return;
       const key = normalize(row.item);
       const item = map.get(key) || {
         name: row.item,
@@ -72,7 +90,7 @@ export function ItemsOverviewPage({ rows, onSetDraft, onSavePrice }) {
       map.set(key, item);
     });
     return [...map.values()].sort((a, b) => b.paused - a.paused || a.name.localeCompare(b.name, 'pt-BR'));
-  }, [scopedRows]);
+  }, [scopedRows, effectiveIgnores]);
 
   // Qualquer item sem preço em nenhuma ocorrência — ativo ou pausado, tanto
   // faz — entra aqui pra poder receber um valor local (não salvo).
@@ -146,7 +164,16 @@ export function ItemsOverviewPage({ rows, onSetDraft, onSavePrice }) {
             onChange={(event) => changeFilter(() => setQuery(event.target.value))}
           />
           <div className="items-status-chips">{[['all','Todos'],['active','Ativos'],['paused','Pausados']].map(([value,label]) => <button type="button" key={value} className={status === value ? 'active' : ''} onClick={() => changeFilter(() => setStatus(value))}>{label}</button>)}</div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: C.muted, fontWeight: 600 }}>
+            <input type="checkbox" checked={showIgnored} onChange={(event) => setShowIgnored(event.target.checked)} />
+            Mostrar ignorados
+          </label>
         </div>
+        {ignoresError && (
+          <div style={{ padding: '9px 12px', borderRadius: 9, background: C.redL, color: C.red, fontSize: 11, fontWeight: 600, marginBottom: 10 }}>
+            Não foi possível carregar as exclusões cadastradas — itens que deveriam estar ocultos podem estar aparecendo.
+          </div>
+        )}
         <div className="items-table-wrap">
           <table className="items-table">
             <thead>
@@ -157,18 +184,50 @@ export function ItemsOverviewPage({ rows, onSetDraft, onSavePrice }) {
                 <SortTh column="paused">Pausou no período</SortTh>
                 <SortTh column="affected">Unidades afetadas</SortTh>
                 <SortTh column="risk">Risco</SortTh>
+                {onCreateIgnore && <th></th>}
               </tr>
             </thead>
             <tbody>
               {paginated.map((item) => (
-                <tr key={item.name}>
-                  <td><strong>{item.name}</strong></td>
-                  <td>{item.category || 'Sem categoria'}</td>
-                  <td><Pill color={C.green} bg={C.greenL}>{item.active}×</Pill></td>
-                  <td><Pill color={C.red} bg={C.redL}>{item.paused}×</Pill></td>
-                  <td>{item.pausedStores.size} de {item.stores.size}</td>
-                  <td>{item.risk > 0 ? brl(item.risk) : '—'}</td>
-                </tr>
+                <Fragment key={item.name}>
+                  <tr>
+                    <td><strong>{item.name}</strong></td>
+                    <td>{item.category || 'Sem categoria'}</td>
+                    <td><Pill color={C.green} bg={C.greenL}>{item.active}×</Pill></td>
+                    <td><Pill color={C.red} bg={C.redL}>{item.paused}×</Pill></td>
+                    <td>{item.pausedStores.size} de {item.stores.size}</td>
+                    <td>{item.risk > 0 ? brl(item.risk) : '—'}</td>
+                    {onCreateIgnore && (
+                      <td>
+                        {ignoredItemNames.has(item.name) ? (
+                          <Pill color={C.purple} bg={C.purpleL} s={10}>Ignorado</Pill>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setIgnoringItem(ignoringItem === item.name ? null : item.name)}
+                            style={{ border: 'none', background: 'none', cursor: 'pointer', color: C.blue, fontSize: 10, fontWeight: 700 }}
+                          >
+                            {ignoringItem === item.name ? 'Cancelar' : 'Ignorar'}
+                          </button>
+                        )}
+                      </td>
+                    )}
+                  </tr>
+                  {ignoringItem === item.name && (
+                    <tr>
+                      <td colSpan={onCreateIgnore ? 7 : 6} style={{ background: C.bg }}>
+                        <AlertIgnoreForm
+                          compact
+                          fixedType="item"
+                          fixedTarget={item.name}
+                          catalogOptions={catalogOptions}
+                          onCreate={onCreateIgnore}
+                          onDone={() => setIgnoringItem(null)}
+                        />
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
               ))}
             </tbody>
           </table>

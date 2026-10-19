@@ -15,3 +15,5 @@ __pycache__/
 data/
 INICIAR_DASHBOARD.bat
 .pytest_local_tmp/
+.vercel
+.env*

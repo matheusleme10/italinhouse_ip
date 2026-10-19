@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { AccessLogsPage } from './AccessLogsPage.jsx';
 import { Kpi } from '../components/ui/Kpi.jsx';
+import { AlertIgnoreManager } from '../components/ui/AlertIgnoreManager.jsx';
 import { C } from '../constants.js';
 
 const DIACRITICS_RANGE = String.fromCharCode(0x0300) + '-' + String.fromCharCode(0x036f);
@@ -118,7 +119,38 @@ function FeedbackTable() {
   );
 }
 
-export function ManagementPage() {
+export function ManagementPage({ alertIgnores }) {
   const [section, setSection] = useState('emails');
-  return <section className="management-page"><header className="page-hero"><span className="eyebrow">GESTÃO DO PORTAL</span><h1>Gestão</h1><p>Permissões de e-mail, auditoria de acessos e opinião dos franqueados em um só lugar.</p></header><nav className="management-tabs">{[['emails','1 · Gestão de e-mails'],['logs','2 · Logs de acesso'],['feedback','3 · Feedbacks recebidos']].map(([id,label]) => <button type="button" key={id} className={section === id ? 'active' : ''} onClick={() => setSection(id)}>{label}</button>)}</nav>{section === 'feedback' ? <FeedbackTable /> : <AccessLogsPage section={section} embedded />}</section>;
+  const sections = [
+    ['emails', '1 · Gestão de e-mails'],
+    ['logs', '2 · Logs de acesso'],
+    ['feedback', '3 · Feedbacks recebidos'],
+    ['ignores', '4 · Exclusões de monitoramento'],
+  ];
+  return (
+    <section className="management-page">
+      <header className="page-hero">
+        <span className="eyebrow">GESTÃO DO PORTAL</span>
+        <h1>Gestão</h1>
+        <p>Permissões de e-mail, auditoria de acessos, opinião dos franqueados e exclusões de monitoramento em um só lugar.</p>
+      </header>
+      <nav className="management-tabs">
+        {sections.map(([id, label]) => (
+          <button type="button" key={id} className={section === id ? 'active' : ''} onClick={() => setSection(id)}>{label}</button>
+        ))}
+      </nav>
+      {section === 'feedback' && <FeedbackTable />}
+      {section === 'ignores' && alertIgnores && (
+        <AlertIgnoreManager
+          rules={alertIgnores.rules}
+          loading={alertIgnores.loading}
+          error={alertIgnores.error}
+          catalogOptions={alertIgnores.catalogOptions}
+          onCreate={alertIgnores.create}
+          onRestore={alertIgnores.restore}
+        />
+      )}
+      {(section === 'emails' || section === 'logs') && <AccessLogsPage section={section} embedded />}
+    </section>
+  );
 }

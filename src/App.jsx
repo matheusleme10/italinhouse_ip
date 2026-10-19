@@ -31,6 +31,8 @@ import { isSameStore, resolveStoreSelection } from './utils/stores.js';
 import { applyPriceDrafts, emptyDrafts, withPriceDraft } from './utils/price-drafts.js';
 import { applyPriceOverrides, fetchPriceOverrides, overrideKey, savePriceOverride } from './utils/price-overrides.js';
 import { collapseShiftRows } from './utils/analytics.js';
+import { useAlertIgnores } from './hooks/useAlertIgnores.js';
+import { buildAlertCatalogOptions } from './utils/alert-ignores.js';
 
 const AdminPage = lazy(() => import('./pages/AdminPage.jsx').then((module) => ({ default: module.AdminPage })));
 const AutomatedNotificationPage = lazy(() => import('./pages/AutomatedNotificationPage.jsx').then((module) => ({ default: module.AutomatedNotificationPage })));
@@ -332,6 +334,14 @@ export function App() {
     return () => { cancelled = true; };
   }, [summary, effectiveFrom, effectiveTo]);
   const isAdmin = auth?.role === 'admin';
+  // Fonte única das regras de exclusão de monitoramento (ver
+  // src/hooks/useAlertIgnores.js) — chamada uma vez aqui e repassada como
+  // prop pras páginas que consomem (Itens, Categorias, Alertas, Gestão),
+  // igual ao padrão já usado para priceOverrides. Só habilita a busca
+  // quando já há sessão (e, pra franquia, unidade selecionada) — mesma
+  // condição de fetchPriceOverrides abaixo.
+  const alertIgnoresEnabled = Boolean(auth?.role) && (auth.role !== 'franchise' || Boolean(context?.store));
+  const alertIgnores = useAlertIgnores(alertIgnoresEnabled);
   const scopeBrand = isAdmin ? filters.brandId : (context?.brandId || 'all');
   const franchiseStoreCandidates = useMemo(() => [...new Set(unitHistory
     .map((entry) => entry.label)
@@ -457,6 +467,11 @@ export function App() {
   // Potencial precisa preservar Almoço e Jantar separadamente quando o filtro
   // está em Ambos; as demais páginas podem colapsar turnos para contar itens.
   const potentialRows = useMemo(() => applyPriceDrafts(overriddenDetailRows, priceDrafts), [overriddenDetailRows, priceDrafts]);
+  // Catálogo real (marcas/unidades/categorias/itens) pra o formulário de
+  // "nova exclusão" centralizado em Gestão — deriva do mesmo
+  // draftedDetailRows que as outras páginas admin usam, nunca de uma lista
+  // fixa de marcas/unidades.
+  const alertIgnoreCatalogOptions = useMemo(() => buildAlertCatalogOptions(draftedDetailRows), [draftedDetailRows]);
   const shiftHasNetworkData = effectiveShift === 'Ambos'
     || (metadata.networkHistory || []).some((entry) => entry.shift === effectiveShift)
     || unitHistory.some((entry) => entry.shift === effectiveShift);
@@ -561,9 +576,13 @@ export function App() {
           )}
           {tab === 'franch' && isAdmin && <FranchPage today={pageRows} detailRows={draftedDetailRows} historical={!isLatestSingle} />}
           {tab === 'items' && (isAdmin
-            ? <ItemsOverviewPage rows={exactSnapshotDates.length ? draftedDetailRows : draftedProductRows} onSetDraft={setPriceDraft} onSavePrice={persistPrice} />
-            : <FranchiseCatalogPage rows={draftedDetailRows} onSetDraft={setPriceDraft} onSavePrice={persistPrice} />)}
-          {tab === 'cats' && <CatPage today={isAdmin && productRows.length ? draftedProductRows : draftedDetailRows} showFinancials={isAdmin} />}
+            ? <ItemsOverviewPage rows={exactSnapshotDates.length ? draftedDetailRows : draftedProductRows} onSetDraft={setPriceDraft} onSavePrice={persistPrice}
+                alertIgnores={alertIgnores.rules} ignoresLoading={alertIgnores.loading} ignoresError={alertIgnores.error} onCreateIgnore={alertIgnores.create} />
+            : <FranchiseCatalogPage rows={draftedDetailRows} onSetDraft={setPriceDraft} onSavePrice={persistPrice}
+                alertIgnores={alertIgnores.rules} ignoresError={alertIgnores.error} />)}
+          {tab === 'cats' && <CatPage today={isAdmin && productRows.length ? draftedProductRows : draftedDetailRows} showFinancials={isAdmin}
+            canManageIgnores={isAdmin} alertIgnores={alertIgnores.rules} ignoresLoading={alertIgnores.loading} ignoresError={alertIgnores.error}
+            onCreateIgnore={isAdmin ? alertIgnores.create : undefined} />}
           {tab === 'rank' && <RankPage today={isAdmin ? networkRows : rankingRows} periodFrom={effectiveFrom} periodTo={effectiveTo}
             showFinancials={isAdmin} selectedStore={isAdmin ? '' : context?.store} />}
           {tab === 'forneria' && <ForneriaPage rows={exactSnapshotDates.length ? draftedDetailRows : draftedProductRows}
@@ -572,10 +591,22 @@ export function App() {
           {tab === 'revenue' && (isAdmin
             ? <PotentialPageV2 rows={potentialRows} shift={effectiveShift} isAdmin onSetDraft={setPriceDraft} />
             : <PotentialAccessGate><PotentialPageV2 rows={potentialRows} shift={effectiveShift} onSetDraft={setPriceDraft} /></PotentialAccessGate>)}
-          {tab === 'alerts' && isAdmin && <AlertsPage today={exactSnapshotDates.length ? draftedDetailRows : draftedProductRows} />}
-          {tab === 'alerts' && !isAdmin && <FranchiseAlertsPage all={draftedDetailRows} />}
+          {tab === 'alerts' && isAdmin && (
+            <AlertsPage today={exactSnapshotDates.length ? draftedDetailRows : draftedProductRows}
+              alertIgnores={alertIgnores.rules} ignoresLoading={alertIgnores.loading} ignoresError={alertIgnores.error}
+              onCreateIgnore={alertIgnores.create} />
+          )}
+          {tab === 'alerts' && !isAdmin && (
+            <FranchiseAlertsPage all={draftedDetailRows}
+              alertIgnores={alertIgnores.rules} ignoresLoading={alertIgnores.loading} ignoresError={alertIgnores.error} />
+          )}
           {tab === 'notify' && isAdmin && <AutomatedNotificationPage />}
-          {tab === 'access' && isAdmin && <ManagementPage />}
+          {tab === 'access' && isAdmin && (
+            <ManagementPage alertIgnores={{
+              rules: alertIgnores.rules, loading: alertIgnores.loading, error: alertIgnores.error,
+              catalogOptions: alertIgnoreCatalogOptions, create: alertIgnores.create, restore: alertIgnores.restore,
+            }} />
+          )}
           {tab === 'feedback' && !isAdmin && <FranchiseFeedbackPage />}
           {tab === 'update' && isAdmin && (
             <AdminPage all={all} initialAuth
